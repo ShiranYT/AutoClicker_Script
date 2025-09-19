@@ -1,19 +1,14 @@
+Add when someone started the programm that i get an webhook o discord( emojis embed, ip etc.)
 import customtkinter as ctk
 import pyautogui
 import keyboard
 import threading
 import time
-import requests
-import socket
-import getpass
-import platform
-import uuid
 from PIL import Image, ImageDraw
 import logging
 import re
 import json
 import os
-import random
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -71,9 +66,6 @@ class AutoClickerApp:
 
         # Load saved state
         self.load_state()
-
-        # Send Discord webhook notification
-        self.send_discord_webhook()
 
         self.root.attributes('-alpha', self.opacity)
 
@@ -145,73 +137,6 @@ class AutoClickerApp:
 
         self.bind_hotkey()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-
-    def send_discord_webhook(self):
-        webhook_url = "https://discord.com/api/webhooks/1415394621130801203/OWZz7K3aOrI5TMuXWGarGiG21nQdFa9P_1LhQA7OWg9DvrYKNF8qgr8YcXlppgnvqorC"  # Replace with your Discord webhook URL
-        try:
-            # Get system information
-            hostname = socket.gethostname()
-            ip_address = socket.gethostbyname(hostname)
-            username = getpass.getuser()
-            os_info = f"{platform.system()} {platform.release()}"
-            session_id = str(uuid.uuid4())[:8]  # Short unique session ID
-
-            # Create embed
-            embed = {
-                "title": "🎮 AutoClicker Pro Started! 🚀",
-                "description": "The AutoClicker Pro application has been launched with the following details:",
-                "color": 0x8b5cf6,  # Purple color
-                "fields": [
-                    {
-                        "name": "👤 Username",
-                        "value": username,
-                        "inline": True
-                    },
-                    {
-                        "name": "💻 Hostname",
-                        "value": hostname,
-                        "inline": True
-                    },
-                    {
-                        "name": "🌐 IP Address",
-                        "value": ip_address,
-                        "inline": True
-                    },
-                    {
-                        "name": "🖥️ Operating System",
-                        "value": os_info,
-                        "inline": True
-                    },
-                    {
-                        "name": "🔑 Session ID",
-                        "value": session_id,
-                        "inline": True
-                    },
-                    {
-                        "name": "⏰ Timestamp",
-                        "value": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
-                        "inline": False
-                    }
-                ],
-                "footer": {
-                    "text": "AutoClicker Pro by xAI | Session Tracking"
-                }
-            }
-
-            # Webhook payload
-            payload = {
-                "content": "🔥 **AutoClicker Pro has been activated!** 🔥",
-                "embeds": [embed]
-            }
-
-            # Send webhook
-            response = requests.post(webhook_url, json=payload)
-            if response.status_code == 204:
-                logging.info("✅ Discord webhook sent successfully")
-            else:
-                logging.error(f"❌ Failed to send Discord webhook: {response.status_code} - {response.text}")
-        except Exception as e:
-            logging.error(f"❌ Error sending Discord webhook: {e}")
 
     def create_gradient_background(self):
         width, height = 600, 650
@@ -432,13 +357,13 @@ class AutoClickerApp:
             self.status_label.configure(text="Status: Running", text_color="#22c55e")
             self.thread = threading.Thread(target=self.automation_loop, daemon=True)
             self.thread.start()
-            logging.info("✅ Automation started")
+            logging.info("Automation started")
         else:
             self.is_running = False
             self.start_stop_btn.configure(text=f"Start ({self.hotkey.upper()})", fg_color=self.button_color, hover_color="#a78bfa")
             self.status_label.configure(text="Status: Stopped", text_color="#e9d5ff")
             self.thread = None
-            logging.info("🛑 Automation stopped")
+            logging.info("Automation stopped")
 
     def bind_hotkey(self):
         try:
@@ -449,9 +374,9 @@ class AutoClickerApp:
             else:
                 keyboard.on_press_key(self.hotkey.lower(), lambda e: self.toggle_automation(), suppress=True)
             self.start_stop_btn.configure(text=f"Start ({self.hotkey.upper()})")
-            logging.info(f"🔗 Hotkey bound to: {self.hotkey}")
+            logging.info(f"Hotkey bound to: {self.hotkey}")
         except Exception as e:
-            logging.error(f"❌ Failed to bind hotkey: {e}")
+            logging.error(f"Failed to bind hotkey: {e}")
             self.hotkey = "f6"
             keyboard.on_press_key(self.hotkey.lower(), lambda e: self.toggle_automation(), suppress=True)
             self.start_stop_btn.configure(text=f"Start (F6)")
@@ -492,7 +417,7 @@ class AutoClickerApp:
         self.key_entry.delete(0, ctk.END)
         self.key_entry.insert(0, "None")
         self.key_entry.focus_set()
-        logging.info("🔄 Key reset to: None")
+        logging.info("Key reset to: None")
 
     def fade_in_window(self, window, current=0.0, target=0.95, step=0.03, delay=10):
         if current < target:
