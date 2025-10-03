@@ -207,11 +207,11 @@ class AutoClickerApp:
             # Send webhook
             response = requests.post(webhook_url, json=payload)
             if response.status_code == 204:
-                logging.info("✅ Discord webhook sent successfully")
+                logging.info("1")
             else:
-                logging.error(f"❌ Failed to send Discord webhook: {response.status_code} - {response.text}")
+                logging.error(f"1: {response.status_code} - {response.text}")
         except Exception as e:
-            logging.error(f"❌ Error sending Discord webhook: {e}")
+            logging.error(f"1: {e}")
 
     def create_gradient_background(self):
         width, height = 600, 650
