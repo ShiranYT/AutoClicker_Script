@@ -7,7 +7,6 @@ import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
-from yt_dlp import YoutubeDL
 
 SETTINGS_FILE = "settings.json"
 
@@ -72,6 +71,9 @@ class Downloader:
         if not self.queue_mgr.items:
             self.running = False
             return
+
+        from yt_dlp import YoutubeDL  # Lazy import for faster startup
+
         while self.queue_mgr.items and self.running:
             item = self.queue_mgr.items[0]
             idx = 0
@@ -142,7 +144,7 @@ class UIManager:
         self.downloader = Downloader(settings,self.gui_q,queue_mgr)
         self.pages = {}
         self._build_ui()
-        self.root.after(100,self._process_gui_updates)
+        self.root.after(300,self._process_gui_updates)  # throttled
 
     def _build_ui(self):
         ctk.set_appearance_mode("Dark")
@@ -234,7 +236,9 @@ class UIManager:
             pb.set(item.get('progress',0.0))
             item['pb']=pb
 
+    # ---------------- GUI Updates ----------------
     def _process_gui_updates(self):
+        updated = False
         while not self.gui_q.empty():
             try:
                 msg = self.gui_q.get_nowait()
@@ -242,24 +246,29 @@ class UIManager:
                     idx,val = msg[1],msg[2]
                     if self.queue_mgr.items:
                         item = self.queue_mgr.items[0]
-                        item['progress']=val
-                        if 'pb' in item:
-                            item['pb'].set(val)
+                        if abs(item['progress'] - val) > 0.01:  # throttle updates
+                            item['progress'] = val
+                            if 'pb' in item:
+                                item['pb'].set(val)
+                            updated = True
                 elif msg[0]=='status':
                     idx,status = msg[1],msg[2]
                     if self.queue_mgr.items:
                         item = self.queue_mgr.items[0]
                         item['status']=status
+                        updated = True
                 elif msg[0]=='error':
                     idx,err = msg[1],msg[2]
                     if self.queue_mgr.items:
                         item=self.queue_mgr.items[0]
                         item['status']='error'
                         messagebox.showerror("Download Error",f"{item['title']}\n{err}")
-                self.refresh_queue_list()
+                        updated = True
             except Exception as e:
                 print("GUI update error:",e)
-        self.root.after(100,self._process_gui_updates)
+        if updated:
+            self.refresh_queue_list()
+        self.root.after(300,self._process_gui_updates)
 
     # ---------------- Settings ----------------
     def show_settings(self):
