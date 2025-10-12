@@ -7,323 +7,824 @@ import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import customtkinter as ctk
+from datetime import datetime
+import re
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+import logging
 
+# ---------------- Constants ----------------
 SETTINGS_FILE = "settings.json"
+HISTORY_FILE = "download_history.json"
+LOG_FILE = "downloader.log"
+DEFAULT_SETTINGS = {
+    "download_dir": "",
+    "ask_folder": True,
+    "cookies": "",
+    "audio_format": "mp3",
+    "audio_bitrate": "192",
+    "video_format": "mp4",
+    "video_quality": "best",
+    "simultaneous_downloads": 1,
+    "theme": "dark",
+    "color_theme": "blue",
+    "max_history_entries": 100,
+    "audio_effect": "none",
+    "download_subtitles": False,
+    "subtitle_lang": "en",
+    "download_thumbnail": False,
+    "rate_limit": "",
+    "proxy": ""
+}
 
-# ---------------- Settings ----------------
+# ---------------- Logging Setup ----------------
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# ---------------- Utility Functions ----------------
+def format_size(size):
+    """Convert bytes to human-readable format (e.g., KB, MB)."""
+    if size is None:
+        return ''
+    size = float(size)
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} PB"
+
+def validate_url(url):
+    """Validate YouTube URL using regex."""
+    youtube_regex = r"(?:https?://)?(?:www\.)?(?:youtube\.com|youtu\.be)/.+"
+    return bool(re.match(youtube_regex, url))
+
+# ---------------- Settings Manager ----------------
 class SettingsManager:
+    """Manage application settings with save/load functionality."""
     def __init__(self, path=SETTINGS_FILE):
         self.path = path
-        self.data = {
-            "download_dir": "",
-            "ask_folder": True,
-            "cookies": "",
-            "audio_format": "mp3",
-            "audio_bitrate": "192",
-            "video_format": "mp4",
-            "video_quality": "best",
-            "simultaneous_downloads": 1
-        }
+        self.data = DEFAULT_SETTINGS.copy()
         self.load()
+
     def load(self):
+        """Load settings from JSON file or use defaults if file is missing/invalid."""
         if os.path.exists(self.path):
             try:
                 with open(self.path, "r", encoding="utf-8") as f:
-                    self.data.update(json.load(f))
-            except Exception:
-                print("Failed to load settings. Using defaults.")
+                    loaded = json.load(f)
+                    self.data.update({k: v for k, v in loaded.items() if k in self.data})
+                logging.info("Settings loaded successfully.")
+            except Exception as e:
+                logging.error(f"Failed to load settings: {e}. Using defaults.")
+
     def save(self):
+        """Save settings to JSON file."""
         try:
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(self.data, f, indent=4)
+            logging.info("Settings saved successfully.")
         except Exception as e:
-            print("Failed to save settings:", e)
+            logging.error(f"Failed to save settings: {e}")
 
-# ---------------- Queue ----------------
+    def update(self, key, value):
+        """Update a single setting and save."""
+        if key in self.data:
+            if key == "simultaneous_downloads":
+                try:
+                    value = int(value)
+                    if value < 1:
+                        raise ValueError("Simultaneous downloads must be at least 1")
+                except (ValueError, TypeError):
+                    logging.warning(f"Invalid simultaneous_downloads value: {value}. Defaulting to 1.")
+                    value = 1
+            elif key == "rate_limit" and value:
+                if not re.match(r"^\d+[KM]?$", value):
+                    logging.warning(f"Invalid rate_limit format: {value}. Ignoring.")
+                    return
+            self.data[key] = value
+            self.save()
+
+# ---------------- History Manager ----------------
+class HistoryManager:
+    """Manage download history with save/load and max entry limits."""
+    def __init__(self, path=HISTORY_FILE, max_entries=100):
+        self.path = path
+        self.max_entries = max_entries
+        self.history = []
+        self.load()
+
+    def load(self):
+        """Load history from JSON file."""
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self.history = json.load(f)
+                logging.info("History loaded successfully.")
+            except Exception:
+                logging.error("Failed to load history. Starting fresh.")
+                self.history = []
+
+    def save(self):
+        """Save history to JSON file, respecting max_entries."""
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.history[-self.max_entries:], f, indent=4)
+            logging.info("History saved successfully.")
+        except Exception as e:
+            logging.error(f"Failed to save history: {e}")
+
+    def add(self, item):
+        """Add a download item to history."""
+        self.history.append({
+            "url": item["url"],
+            "title": item["title"],
+            "type": item["type"],
+            "effect": item.get("effect", "none"),
+            "timestamp": datetime.now().isoformat(),
+            "status": item["status"],
+            "file_path": item.get("file_path", "")
+        })
+        self.save()
+
+    def clear(self):
+        """Clear all history entries."""
+        self.history.clear()
+        self.save()
+
+# ---------------- Queue Manager ----------------
 class QueueManager:
-    def __init__(self):
+    """Manage download queue and playlist metadata caching."""
+    def __init__(self, settings):
+        self.settings = settings
         self.items = []
-    def add(self, url, title, type_):
-        item = {'url': url, 'title': title or url, 'type': type_, 'progress': 0.0, 'status': 'queued'}
-        self.items.append(item)
-        return item
+        self.playlist_cache = {}
+
+    def add(self, url, type_, start=0, limit=10):
+        """Add a URL to the queue, handling single videos or playlists."""
+        from yt_dlp import YoutubeDL
+        cache_key = f"{url}_{start}_{limit}"
+        if cache_key in self.playlist_cache:
+            return self.playlist_cache[cache_key], self.playlist_cache.get(f"{url}_total", 1)
+
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': True,
+            'playlist_items': f'{start + 1}-{start + limit}',
+            'cookiefile': self.settings.data.get("cookies") or None
+        }
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            if info.get('_type') == 'playlist' and len(info.get('entries', [])) > 0:
+                entries = info['entries']
+                total_entries = info.get('playlist_count', len(entries))
+                result = [{
+                    'url': entry.get('url'),
+                    'title': entry.get('title', entry.get('url')),
+                    'duration': entry.get('duration_string', ''),
+                    'filesize': entry.get('filesize_approx', entry.get('filesize', None)),
+                    'selected': tk.BooleanVar(value=True)
+                } for entry in entries if entry]
+                self.playlist_cache[cache_key] = result
+                self.playlist_cache[f"{url}_total"] = total_entries
+                return result, total_entries
+            else:
+                item = {
+                    'url': url,
+                    'title': info.get('title', url),
+                    'type': type_,
+                    'effect': self.settings.data.get("audio_effect", "none"),
+                    'progress': 0.0,
+                    'status': 'queued',
+                    'file_path': "",
+                    'duration': info.get('duration_string', ''),
+                    'filesize': info.get('filesize_approx', info.get('filesize', None))
+                }
+                self.items.append(item)
+                return item, 1
+        except Exception as e:
+            logging.error(f"Failed to add URL {url}: {e}")
+            messagebox.showerror("Error", f"Failed to add URL: {e}. Check your network or URL.")
+            return None, 0
+
+    def add_selected(self, items, type_):
+        """Add selected playlist items to the queue."""
+        for item in items:
+            if item['selected'].get():
+                self.items.append({
+                    'url': item['url'],
+                    'title': item['title'],
+                    'type': type_,
+                    'effect': self.settings.data.get("audio_effect", "none"),
+                    'progress': 0.0,
+                    'status': 'queued',
+                    'file_path': "",
+                    'duration': item['duration'],
+                    'filesize': item['filesize']
+                })
+
     def remove(self, index):
+        """Remove an item from the queue by index."""
         if 0 <= index < len(self.items):
             del self.items[index]
+
     def clear(self):
+        """Clear all items from the queue."""
         self.items.clear()
 
 # ---------------- Downloader ----------------
 class Downloader:
-    def __init__(self, settings: SettingsManager, gui_queue: pyqueue.Queue, queue_mgr: QueueManager):
+    """Handle downloading and post-processing of queue items."""
+    def __init__(self, settings, gui_queue, queue_mgr, history_mgr):
         self.settings = settings
         self.gui_q = gui_queue
         self.queue_mgr = queue_mgr
+        self.history_mgr = history_mgr
         self.running = False
+        self.active_downloads = 0
+        self.lock = threading.Lock()
+
     def start_downloads(self):
+        """Start download threads based on simultaneous_downloads setting."""
         if self.running:
             return
         self.running = True
-        threading.Thread(target=self._download_thread, daemon=True).start()
+        sim = max(1, self.settings.data.get("simultaneous_downloads", 1))
+        for _ in range(sim):
+            threading.Thread(target=self._download_thread, daemon=True).start()
+
     def stop(self):
+        """Stop all download threads."""
         self.running = False
+
     def _download_thread(self):
-        if not self.queue_mgr.items:
-            self.running = False
-            return
+        """Process queue items in a separate thread."""
+        from yt_dlp import YoutubeDL
+        while self.running:
+            item = None
+            idx = -1
+            with self.lock:
+                for i, it in enumerate(self.queue_mgr.items):
+                    if it['status'] == 'queued':
+                        it['status'] = 'downloading'
+                        item = it
+                        idx = i
+                        self.active_downloads += 1
+                        break
 
-        from yt_dlp import YoutubeDL  # Lazy import for faster startup
+            if item is None:
+                break
 
-        while self.queue_mgr.items and self.running:
-            item = self.queue_mgr.items[0]
-            idx = 0
-            self.gui_q.put(('status', idx, 'downloading'))
-
-            save_path = self.settings.data.get('download_dir') or filedialog.askdirectory(title="Select download directory")
+            save_path = self._get_save_path()
             if not save_path:
-                self.running = False
-                return
-            self.settings.data['download_dir'] = save_path
+                self.gui_q.put(("status", idx, "error"))
+                self.gui_q.put(("error", idx, "No download directory selected"))
+                with self.lock:
+                    self.active_downloads -= 1
+                continue
 
-            cookies_file = self.settings.data.get('cookies') or None
-
-            # Download options
-            if item['type'] == 'audio':
-                file_type = self.settings.data.get('audio_format','mp3')
-                bitrate = self.settings.data.get('audio_bitrate','192')
-                ydl_opts = {
-                    'outtmpl': os.path.join(save_path, '%(title)s.%(ext)s'),
-                    'format':'bestaudio/best',
-                    'noplaylist': True,
-                    'quiet': True,
-                    'progress_hooks':[lambda d:self._progress_hook(d, idx)]
-                }
-                if cookies_file: ydl_opts['cookiefile'] = cookies_file
-                ydl_opts['postprocessors']=[{'key':'FFmpegExtractAudio',
-                                             'preferredcodec':file_type,
-                                             'preferredquality':str(bitrate)}]
-            else:  # video
-                file_type = self.settings.data.get('video_format','mp4')
-                quality = self.settings.data.get('video_quality','best')
-                ydl_opts = {
-                    'outtmpl': os.path.join(save_path, '%(title)s.%(ext)s'),
-                    'format': quality,
-                    'noplaylist': True,
-                    'quiet': True,
-                    'progress_hooks':[lambda d:self._progress_hook(d, idx)]
-                }
-                if cookies_file: ydl_opts['cookiefile'] = cookies_file
-
+            ydl_opts = self._get_ydl_opts(item, save_path)
             try:
                 with YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([item['url']])
-                self.gui_q.put(('progress', idx,1.0))
-                self.gui_q.put(('status', idx,'done'))
+                    info = ydl.extract_info(item["url"], download=True)
+                self.gui_q.put(("progress", idx, 1.0))
+                self.gui_q.put(("status", idx, "done"))
+
+                if item["type"] == "audio" and item.get("effect", "none") != "none":
+                    self._apply_audio_effect(item)
+                self.history_mgr.add(item)
             except Exception as e:
                 tb = traceback.format_exc()
-                print("Download error:",e,tb)
-                self.gui_q.put(('status', idx,'error'))
-                self.gui_q.put(('error', idx,str(e)))
-            self.queue_mgr.remove(0)
-        self.running = False
+                logging.error(f"Download error for {item['url']}: {e}\n{tb}")
+                self.gui_q.put(("status", idx, "error"))
+                self.gui_q.put(("error", idx, str(e)))
+            finally:
+                with self.lock:
+                    self.active_downloads -= 1
 
-    def _progress_hook(self, d, idx):
-        if d.get('status')=='downloading':
-            downloaded = d.get('downloaded_bytes',0)
-            total = d.get('total_bytes') or d.get('total_bytes_estimate',1)
-            frac = float(downloaded)/max(int(total),1)
-            self.gui_q.put(('progress', idx, min(max(frac,0.0),1.0)))
+    def _get_save_path(self):
+        """Get or prompt for download directory."""
+        save_path = self.settings.data.get("download_dir")
+        if self.settings.data.get("ask_folder", True) or not save_path:
+            save_path = filedialog.askdirectory(title="Select download directory")
+            if save_path:
+                self.settings.update("download_dir", save_path)
+        return save_path
 
-# ---------------- UI ----------------
+    def _get_ydl_opts(self, item, save_path):
+        """Generate yt-dlp options for a download item."""
+        base_opts = {
+            "outtmpl": os.path.join(save_path, "%(title)s.%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "progress_hooks": [lambda d: self._progress_hook(d, item)],
+            "no_warnings": True
+        }
+        cookies = self.settings.data.get("cookies")
+        if cookies and os.path.exists(cookies):
+            base_opts["cookiefile"] = cookies
+        if self.settings.data.get("rate_limit"):
+            base_opts["limit_rate"] = self.settings.data["rate_limit"]
+        if self.settings.data.get("proxy"):
+            base_opts["proxy"] = self.settings.data["proxy"]
+        if self.settings.data.get("download_subtitles") and item["type"] == "video":
+            base_opts["writesubtitles"] = True
+            base_opts["subtitleslangs"] = [self.settings.data.get("subtitle_lang", "en")]
+        if self.settings.data.get("download_thumbnail"):
+            base_opts["writethumbnail"] = True
+
+        if item["type"] == "audio":
+            base_opts.update({
+                "format": "bestaudio/best",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": self.settings.data.get("audio_format", "mp3"),
+                    "preferredquality": str(self.settings.data.get("audio_bitrate", "192"))
+                }]
+            })
+            if self.settings.data.get("download_thumbnail"):
+                base_opts["postprocessors"].append({"key": "EmbedThumbnail"})
+        else:
+            base_opts.update({
+                "format": self.settings.data.get("video_quality", "best"),
+            })
+            if self.settings.data.get("download_thumbnail"):
+                base_opts["postprocessors"] = [{"key": "EmbedThumbnail"}]
+        return base_opts
+
+    def _progress_hook(self, d, item):
+        """Handle download progress updates."""
+        if d.get("status") == "downloading":
+            downloaded = d.get("downloaded_bytes", 0)
+            total = d.get("total_bytes") or d.get("total_bytes_estimate", 1)
+            item["progress"] = min(max(float(downloaded) / max(int(total), 1), 0.0), 1.0)
+            idx = self.queue_mgr.items.index(item)
+            self.gui_q.put(("progress", idx, item["progress"]))
+        elif d.get("status") == "finished":
+            item["file_path"] = d.get("filename")
+
+    def _apply_audio_effect(self, item):
+        """Apply audio effect to downloaded audio file."""
+        input_file = item.get("file_path")
+        effect = item.get("effect", "none")
+        if not input_file or not os.path.exists(input_file) or effect == "none":
+            return
+        filter_str = {
+            "8d": "apulsator=hz=0.125",
+            "9d": "apulsator=hz=0.125,aecho=0.8:0.9:1000:0.3"
+        }.get(effect.lower(), "")
+        if not filter_str:
+            return
+        output_file = os.path.splitext(input_file)[0] + f"_{effect.upper()}" + os.path.splitext(input_file)[1]
+        cmd = ["ffmpeg", "-i", input_file, "-af", filter_str, "-y", output_file]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            item["file_path"] = output_file
+            logging.info(f"Applied {effect.upper()} effect to {input_file}")
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Audio effect error: {e}")
+            messagebox.showerror("Audio Effect Error", f"Failed to apply {effect.upper()} effect: {e.stderr.decode()}")
+
+# ---------------- UI Manager ----------------
 class UIManager:
-    def __init__(self, root, settings, queue_mgr):
+    """Manage the GUI, including sidebar, content, and status bar."""
+    def __init__(self, root, settings, queue_mgr, history_mgr):
         self.root = root
         self.settings = settings
         self.queue_mgr = queue_mgr
+        self.history_mgr = history_mgr
         self.gui_q = pyqueue.Queue()
-        self.downloader = Downloader(settings,self.gui_q,queue_mgr)
-        self.pages = {}
+        self.downloader = Downloader(settings, self.gui_q, queue_mgr, history_mgr)
+        self.status_var = tk.StringVar(value="Ready")
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.last_update = 0
         self._build_ui()
-        self.root.after(300,self._process_gui_updates)  # throttled
+        self.root.after(500, self._process_gui_updates)
 
     def _build_ui(self):
-        ctk.set_appearance_mode("Dark")
-        ctk.set_default_color_theme("green")
+        """Initialize the main UI components."""
+        ctk.set_appearance_mode(self.settings.data.get("theme", "dark"))
+        ctk.set_default_color_theme(self.settings.data.get("color_theme", "blue"))
         self.root.title("YouTube Downloader Pro")
-        self.root.geometry("1100x800")
-        self.root.minsize(1000,720)
+        self.root.geometry("1200x900")
+        self.root.minsize(1100, 800)
 
-        # Sidebar
-        self.sidebar = ctk.CTkFrame(self.root,width=220)
-        self.sidebar.pack(side="left",fill="y")
-        ctk.CTkLabel(self.sidebar,text="Downloader Pro",font=("Helvetica",18,"bold")).pack(pady=12)
-        for name,cmd in [("Single Video",self.show_single_video),
-                         ("Single Music",self.show_single_music),
-                         ("Queue",self.show_queue),
-                         ("Settings",self.show_settings)]:
-            ctk.CTkButton(self.sidebar,text=name,command=cmd,width=200,height=40).pack(pady=6)
+        self.sidebar = ctk.CTkFrame(self.root, width=250, corner_radius=10)
+        self.sidebar.pack(side="left", fill="y", padx=10, pady=10)
+        ctk.CTkLabel(self.sidebar, text="YouTube Downloader Pro", font=("Helvetica", 20, "bold")).pack(pady=20)
+        for name, cmd in [
+            ("Single Video", self.show_single_video),
+            ("Single Audio", self.show_single_music),
+            ("Batch Download", self.show_batch_download),
+            ("Playlist Fetch", self.show_playlist_fetch),
+            ("Queue", self.show_queue),
+            ("History", self.show_history),
+            ("Settings", self.show_settings)
+        ]:
+            ctk.CTkButton(self.sidebar, text=name, command=cmd, width=220, height=50, font=("Helvetica", 14)).pack(pady=8, padx=10)
 
-        # Content frame
-        self.content_frame = ctk.CTkFrame(self.root)
-        self.content_frame.pack(side="right",expand=True,fill="both")
+        self.content_frame = ctk.CTkFrame(self.root, corner_radius=10)
+        self.content_frame.pack(side="right", expand=True, fill="both", padx=10, pady=10)
+
+        status_frame = ctk.CTkFrame(self.root, height=30, corner_radius=0)
+        status_frame.pack(side="bottom", fill="x")
+        ctk.CTkLabel(status_frame, textvariable=self.status_var, font=("Helvetica", 12)).pack(side="left", padx=10)
+
         self.show_single_video()
 
+    def _create_option_menu(self, parent, label, values, default, command, width=100):
+        """Create a labeled option menu."""
+        frame = ctk.CTkFrame(parent, corner_radius=8)
+        frame.pack(fill="x", pady=5, padx=10)
+        ctk.CTkLabel(frame, text=label, font=("Helvetica", 12)).pack(side="left", padx=10)
+        var = tk.StringVar(value=default)
+        ctk.CTkOptionMenu(frame, values=values, variable=var, command=command, width=width).pack(side="left")
+        return var
+
+    def _create_entry(self, parent, label, placeholder, default="", width=800):
+        """Create a labeled entry field."""
+        frame = ctk.CTkFrame(parent, corner_radius=8)
+        frame.pack(fill="x", pady=5, padx=10)
+        ctk.CTkLabel(frame, text=label, font=("Helvetica", 12)).pack(side="left", padx=10)
+        entry = ctk.CTkEntry(frame, width=width, placeholder_text=placeholder, font=("Helvetica", 12))
+        entry.pack(side="left", fill="x", expand=True, padx=10)
+        if default:
+            entry.insert(0, default)
+        return entry
+
+    def _create_button(self, parent, text, command, width=200):
+        """Create a button with consistent styling."""
+        return ctk.CTkButton(parent, text=text, command=command, width=width, font=("Helvetica", 12)).pack(pady=5)
+
     def _clear_content(self):
-        for c in self.content_frame.winfo_children():
-            c.destroy()
+        """Clear the content frame."""
+        for widget in self.content_frame.winfo_children():
+            widget.destroy()
+
+    def _async_add(self, url, type_, callback):
+        """Asynchronously add a URL to the queue."""
+        result, total = self.queue_mgr.add(url, type_)
+        self.root.after(0, lambda: callback(result, total, url))
+
+    def _post_add(self, result, total, url, default_type):
+        """Handle post-add actions for single video/audio."""
+        self.status_var.set("Ready")
+        self.root.config(cursor="")
+        if isinstance(result, list):
+            self.show_playlist_fetch(playlist_items=result, default_type=default_type, playlist_url=url, total_entries=total)
+        else:
+            self.show_queue()
 
     # ---------------- Single Video ----------------
     def show_single_video(self):
+        """Display the Single Video download section."""
         self._clear_content()
         page = self.content_frame
-        url_entry=ctk.CTkEntry(page,width=780,placeholder_text="Enter YouTube Video URL")
-        url_entry.pack(pady=6)
-        fmt_var = tk.StringVar(value=self.settings.data.get('video_format','mp4'))
-        quality_var = tk.StringVar(value=self.settings.data.get('video_quality','best'))
-        ctk.CTkOptionMenu(page, values=["mp4","mkv","webm"], variable=fmt_var,
-                           command=lambda v:self._update_setting('video_format',v)).pack(pady=4)
-        ctk.CTkOptionMenu(page, values=["best","360","720","1080"], variable=quality_var,
-                           command=lambda v:self._update_setting('video_quality',v)).pack(pady=4)
-        def add_video_queue():
-            url=url_entry.get().strip()
-            if url:
-                self.queue_mgr.add(url,url,'video')
-                self.show_queue()
-        ctk.CTkButton(page,text="Add to Queue",command=add_video_queue,width=200).pack(pady=10)
+        ctk.CTkLabel(page, text="Download Single Video", font=("Helvetica", 16, "bold")).pack(pady=10)
+        url_entry = self._create_entry(page, "Video URL:", "Enter YouTube Video URL")
+        self._create_option_menu(page, "Format:", ["mp4", "mkv", "webm"],
+                                 self.settings.data.get("video_format", "mp4"),
+                                 lambda v: self.settings.update("video_format", v))
+        self._create_option_menu(page, "Quality:", ["best", "1080", "720", "480", "360"],
+                                 self.settings.data.get("video_quality", "best"),
+                                 lambda v: self.settings.update("video_quality", v))
+        def add_to_queue():
+            url = url_entry.get().strip()
+            if validate_url(url):
+                self.status_var.set("Fetching metadata...")
+                self.root.config(cursor="wait")
+                self.executor.submit(self._async_add, url, "video", partial(self._post_add, default_type="video"))
+            else:
+                messagebox.showerror("Invalid URL", "Please enter a valid YouTube URL")
+        self._create_button(page, "Add to Queue", add_to_queue)
 
-    # ---------------- Single Music ----------------
+    # ---------------- Single Audio ----------------
     def show_single_music(self):
+        """Display the Single Audio download section."""
         self._clear_content()
         page = self.content_frame
-        url_entry=ctk.CTkEntry(page,width=780,placeholder_text="Enter YouTube Audio URL")
-        url_entry.pack(pady=6)
-        fmt_var = tk.StringVar(value=self.settings.data.get('audio_format','mp3'))
-        br_var = tk.StringVar(value=self.settings.data.get('audio_bitrate','192'))
-        ctk.CTkOptionMenu(page, values=["mp3","aac","wav"], variable=fmt_var,
-                           command=lambda v:self._update_setting('audio_format',v)).pack(pady=4)
-        ctk.CTkOptionMenu(page, values=["128","192","320"], variable=br_var,
-                           command=lambda v:self._update_setting('audio_bitrate',v)).pack(pady=4)
-        def add_audio_queue():
-            url=url_entry.get().strip()
-            if url:
-                self.queue_mgr.add(url,url,'audio')
-                self.show_queue()
-        ctk.CTkButton(page,text="Add to Queue",command=add_audio_queue,width=200).pack(pady=10)
+        ctk.CTkLabel(page, text="Download Single Audio", font=("Helvetica", 16, "bold")).pack(pady=10)
+        url_entry = self._create_entry(page, "Audio URL:", "Enter YouTube Audio URL")
+        self._create_option_menu(page, "Format:", ["mp3", "aac", "wav", "flac"],
+                                 self.settings.data.get("audio_format", "mp3"),
+                                 lambda v: self.settings.update("audio_format", v))
+        self._create_option_menu(page, "Bitrate:", ["128", "192", "256", "320"],
+                                 self.settings.data.get("audio_bitrate", "192"),
+                                 lambda v: self.settings.update("audio_bitrate", v))
+        def add_to_queue():
+            url = url_entry.get().strip()
+            if validate_url(url):
+                self.status_var.set("Fetching metadata...")
+                self.root.config(cursor="wait")
+                self.executor.submit(self._async_add, url, "audio", partial(self._post_add, default_type="audio"))
+            else:
+                messagebox.showerror("Invalid URL", "Please enter a valid YouTube URL")
+        self._create_button(page, "Add to Queue", add_to_queue)
+
+    # ---------------- Batch Download ----------------
+    def show_batch_download(self):
+        """Display the Batch Download section."""
+        self._clear_content()
+        page = self.content_frame
+        ctk.CTkLabel(page, text="Batch Download", font=("Helvetica", 16, "bold")).pack(pady=10)
+        ctk.CTkLabel(page, text="Enter URLs (one per line):", font=("Helvetica", 14)).pack(anchor="w", padx=10)
+        text_area = ctk.CTkTextbox(page, width=800, height=150, font=("Helvetica", 12))
+        text_area.pack(pady=10)
+        type_var = tk.StringVar(value="video")
+        self._create_option_menu(page, "Download Type:", ["video", "audio"], type_var.get(),
+                                 lambda v: type_var.set(v))
+        def add_batch():
+            urls = text_area.get("1.0", tk.END).strip().split("\n")
+            self.status_var.set("Fetching metadata...")
+            self.root.config(cursor="wait")
+            self.executor.submit(self._async_batch_add, urls, type_var.get(), partial(self._post_batch_add, default_type=type_var.get()))
+        self._create_button(page, "Add URLs to Queue", add_batch)
+        def load_from_file():
+            file = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
+            if file:
+                with open(file, "r", encoding="utf-8") as f:
+                    text_area.delete("1.0", tk.END)
+                    text_area.insert("1.0", f.read())
+        self._create_button(page, "Load URLs from File", load_from_file)
+
+    def _async_batch_add(self, urls, type_, callback):
+        """Asynchronously add multiple URLs to the queue."""
+        for url in urls:
+            url = url.strip()
+            if validate_url(url):
+                result, total = self.queue_mgr.add(url, type_)
+                if isinstance(result, list):
+                    self.root.after(0, lambda: callback(result, total, url))
+                    return
+        self.root.after(0, lambda: callback(None, 0, None))
+
+    def _post_batch_add(self, result, total, url, default_type):
+        """Handle post-batch add actions."""
+        self.status_var.set("Ready")
+        self.root.config(cursor="")
+        if result and isinstance(result, list):
+            self.show_playlist_fetch(playlist_items=result, default_type=default_type, playlist_url=url, total_entries=total)
+        else:
+            self.show_queue()
+
+    # ---------------- Playlist Fetch ----------------
+    def show_playlist_fetch(self, playlist_items=None, default_type="video", playlist_url="", start=0, total_entries=0):
+        """Display the Playlist Fetch section."""
+        self._clear_content()
+        page = self.content_frame
+        ctk.CTkLabel(page, text="Playlist Fetch", font=("Helvetica", 16, "bold")).pack(pady=10)
+        ctk.CTkLabel(page, text="Fetch Playlist (up to 50 videos):", font=("Helvetica", 14)).pack(anchor="w", padx=10, pady=10)
+        url_entry = self._create_entry(page, "Playlist URL:", "Enter YouTube Playlist URL", playlist_url)
+        type_var = tk.StringVar(value=default_type)
+        self._create_option_menu(page, "Download Type:", ["video", "audio"], default_type,
+                                 lambda v: type_var.set(v))
+        def fetch_playlist():
+            url = url_entry.get().strip()
+            if validate_url(url):
+                self.status_var.set("Fetching playlist...")
+                self.root.config(cursor="wait")
+                self.executor.submit(self._async_add, url, type_var.get(), partial(self._post_add, default_type=type_var.get()))
+            else:
+                messagebox.showerror("Invalid URL", "Please enter a valid YouTube playlist URL")
+        self._create_button(page, "Fetch Playlist", fetch_playlist)
+
+        if playlist_items:
+            if total_entries is None or not isinstance(total_entries, int):
+                total_entries = len(playlist_items)
+                logging.warning(f"total_entries was {total_entries}, defaulting to {len(playlist_items)}")
+            search_var = tk.StringVar()
+            def filter_videos(*args):
+                search_term = search_var.get().strip().lower()
+                self.show_playlist_fetch(playlist_items=[item for item in playlist_items if search_term in item['title'].lower()],
+                                        default_type=type_var.get(), playlist_url=playlist_url, start=start, total_entries=total_entries)
+            search_var.trace_add("write", filter_videos)
+            ctk.CTkLabel(page, text=f"Select Videos to Download (Showing {len(playlist_items)} of {total_entries} videos):",
+                         font=("Helvetica", 14)).pack(anchor="w", padx=10, pady=10)
+            ctk.CTkEntry(page, textvariable=search_var, width=800, placeholder_text="Search videos by title...", font=("Helvetica", 12)).pack(pady=5)
+            button_frame = ctk.CTkFrame(page)
+            button_frame.pack(pady=5)
+            ctk.CTkButton(button_frame, text="Select All", command=lambda: [item['selected'].set(True) for item in playlist_items],
+                          width=100, font=("Helvetica", 12)).pack(side="left", padx=5)
+            ctk.CTkButton(button_frame, text="Deselect All", command=lambda: [item['selected'].set(False) for item in playlist_items],
+                          width=100, font=("Helvetica", 12)).pack(side="left", padx=5)
+            scroll_frame = ctk.CTkScrollableFrame(page, width=800, height=200, fg_color="#1e1e1e", corner_radius=10)
+            scroll_frame.pack(pady=10)
+            for item in playlist_items:
+                frame = ctk.CTkFrame(scroll_frame, height=50, corner_radius=8)
+                frame.pack(fill="x", pady=5, padx=10)
+                info_text = f"{item['title']} ({item['duration']}{', ~' + format_size(item['filesize']) if item['filesize'] else ''})"
+                ctk.CTkCheckBox(frame, text=info_text, variable=item['selected'], font=("Helvetica", 12)).pack(side="left", padx=10)
+            self._create_button(page, "Add Selected to Queue", lambda: [self.queue_mgr.add_selected(playlist_items, type_var.get()), self.show_queue()])
+            if start + len(playlist_items) < min(total_entries, 50):
+                def load_more():
+                    new_start = start + len(playlist_items)
+                    self.status_var.set("Fetching more videos...")
+                    self.root.config(cursor="wait")
+                    self.executor.submit(self._async_add, playlist_url, type_var.get(),
+                                        partial(self._post_load_more, playlist_items=playlist_items, default_type=type_var.get(),
+                                                playlist_url=playlist_url, start=new_start, total_entries=total_entries))
+                self._create_button(page, "Load More", load_more)
+
+    def _post_load_more(self, result, total, playlist_items, default_type, playlist_url, start, total_entries):
+        """Handle loading more playlist items."""
+        self.status_var.set("Ready")
+        self.root.config(cursor="")
+        if result and isinstance(result, list):
+            playlist_items.extend(result)
+            self.show_playlist_fetch(playlist_items=playlist_items, default_type=default_type, playlist_url=playlist_url,
+                                    start=start, total_entries=total)
 
     # ---------------- Queue ----------------
     def show_queue(self):
+        """Display the Queue section with type and effect dropdowns."""
         self._clear_content()
         page = self.content_frame
-        ctrls=ctk.CTkFrame(page)
-        ctrls.pack(fill="x",pady=6)
-        ctk.CTkButton(ctrls,text="Start Queue",command=self.downloader.start_downloads,width=160).pack(side="left",padx=6)
-        ctk.CTkButton(ctrls,text="Stop Downloads",command=self.downloader.stop,width=160).pack(side="left",padx=6)
-        ctk.CTkButton(ctrls,text="Clear Queue",command=lambda:[self.queue_mgr.clear(),self.refresh_queue_list()],width=160).pack(side="left",padx=6)
-        self.queue_scroll=ctk.CTkScrollableFrame(page,width=900,height=480,fg_color="#121212")
-        self.queue_scroll.pack(pady=10)
+        ctk.CTkLabel(page, text="Download Queue", font=("Helvetica", 16, "bold")).pack(pady=10)
+        ctrls = ctk.CTkFrame(page)
+        ctrls.pack(fill="x", pady=10)
+        self._create_button(ctrls, "Start Downloads", self.downloader.start_downloads, width=160)
+        self._create_button(ctrls, "Stop Downloads", self.downloader.stop, width=160)
+        self._create_button(ctrls, "Clear Queue", lambda: [self.queue_mgr.clear(), self.refresh_queue_list()], width=160)
+        self.queue_scroll = ctk.CTkScrollableFrame(page, width=1000, height=600, fg_color="#1e1e1e", corner_radius=10)
+        self.queue_scroll.pack(pady=10, fill="both", expand=True)
         self.refresh_queue_list()
 
     def refresh_queue_list(self):
-        for c in self.queue_scroll.winfo_children():
-            c.destroy()
-        for idx,item in enumerate(self.queue_mgr.items):
-            frame=ctk.CTkFrame(self.queue_scroll,height=50)
-            frame.pack(fill="x",pady=4,padx=6)
-            title_lbl=ctk.CTkLabel(frame,text=f"[{item['type']}] {item['title']}",anchor="w")
-            title_lbl.pack(side="left",padx=8,fill="x",expand=True)
-            pb=ctk.CTkProgressBar(frame,width=200)
-            pb.pack(side="right",padx=6)
-            pb.set(item.get('progress',0.0))
-            item['pb']=pb
+        """Refresh the queue display."""
+        for widget in self.queue_scroll.winfo_children():
+            widget.destroy()
+        for idx, item in enumerate(self.queue_mgr.items):
+            frame = ctk.CTkFrame(self.queue_scroll, height=60, corner_radius=8)
+            frame.pack(fill="x", pady=5, padx=10)
+            info_text = f"{item['title']} ({item['duration']}{', ~' + format_size(item['filesize']) if item['filesize'] else ''})"
+            status_color = {"queued": "#888888", "downloading": "#3498db", "done": "#27ae60", "error": "#e74c3c"}.get(item["status"], "#888888")
+            title_lbl = ctk.CTkLabel(frame, text=info_text, anchor="w", font=("Helvetica", 12))
+            title_lbl.pack(side="left", padx=10, fill="x", expand=True)
+            status_lbl = ctk.CTkLabel(frame, text=item["status"].upper(), text_color=status_color, font=("Helvetica", 12, "bold"))
+            status_lbl.pack(side="right", padx=10)
+            pb = ctk.CTkProgressBar(frame, width=250, progress_color="#3498db")
+            pb.pack(side="right", padx=10)
+            pb.set(item.get("progress", 0.0))
+            item["pb"] = pb
+            item["status_lbl"] = status_lbl
+            self._create_option_menu(frame, "Effect:", ["None", "8D", "9D"], item.get("effect", "none").capitalize(),
+                                     lambda v, i=idx: self._update_queue_item_effect(i, v.lower()), width=100)
+            self._create_option_menu(frame, "Type:", ["video", "audio"], item["type"],
+                                     lambda v, i=idx: self._update_queue_item_type(i, v), width=100)
+            self._create_button(frame, "Remove", lambda i=idx: [self.queue_mgr.remove(i), self.refresh_queue_list()], width=100)
+
+    def _update_queue_item_type(self, index, type_):
+        """Update the type of a queued item."""
+        if 0 <= index < len(self.queue_mgr.items) and self.queue_mgr.items[index]["status"] == "queued":
+            self.queue_mgr.items[index]["type"] = type_
+
+    def _update_queue_item_effect(self, index, effect):
+        """Update the audio effect of a queued item."""
+        if 0 <= index < len(self.queue_mgr.items) and self.queue_mgr.items[index]["status"] == "queued":
+            self.queue_mgr.items[index]["effect"] = effect
+
+    # ---------------- History ----------------
+    def show_history(self):
+        """Display the History section."""
+        self._clear_content()
+        page = self.content_frame
+        ctk.CTkLabel(page, text="Download History", font=("Helvetica", 16, "bold")).pack(pady=10)
+        ctrls = ctk.CTkFrame(page)
+        ctrls.pack(fill="x", pady=10)
+        self._create_button(ctrls, "Clear History", lambda: [self.history_mgr.clear(), self.show_history()], width=160)
+        history_scroll = ctk.CTkScrollableFrame(page, width=1000, height=600, fg_color="#1e1e1e", corner_radius=10)
+        history_scroll.pack(pady=10, fill="both", expand=True)
+        for item in reversed(self.history_mgr.history):
+            frame = ctk.CTkFrame(history_scroll, height=60, corner_radius=8)
+            frame.pack(fill="x", pady=5, padx=10)
+            title_text = f"[{item['type'].upper()}] {item['title']} ({item['timestamp'][:19]})"
+            if item.get("effect", "none") != "none":
+                title_text += f" [Effect: {item['effect'].upper()}]"
+            status_color = {"queued": "#888888", "downloading": "#3498db", "done": "#27ae60", "error": "#e74c3c"}.get(item["status"], "#888888")
+            ctk.CTkLabel(frame, text=title_text, anchor="w", font=("Helvetica", 12)).pack(side="left", padx=10, fill="x", expand=True)
+            ctk.CTkLabel(frame, text=item["status"].upper(), text_color=status_color, font=("Helvetica", 12, "bold")).pack(side="right", padx=10)
+            if item["file_path"] and os.path.exists(item["file_path"]):
+                ctk.CTkButton(frame, text="Open", command=lambda p=item["file_path"]: os.startfile(p) if os.name == 'nt' else subprocess.run(["xdg-open", p]),
+                              width=100).pack(side="right", padx=10)
+                ctk.CTkButton(frame, text="Open Folder", command=lambda p=item["file_path"]: os.startfile(os.path.dirname(p)) if os.name == 'nt' else subprocess.run(["xdg-open", os.path.dirname(p)]),
+                              width=120).pack(side="right", padx=10)
 
     # ---------------- GUI Updates ----------------
     def _process_gui_updates(self):
+        """Process GUI updates with 500ms throttling."""
+        current_time = datetime.now().timestamp()
+        if current_time - self.last_update < 0.5:
+            self.root.after(100, self._process_gui_updates)
+            return
+        self.last_update = current_time
         updated = False
         while not self.gui_q.empty():
             try:
                 msg = self.gui_q.get_nowait()
-                if msg[0]=='progress':
-                    idx,val = msg[1],msg[2]
-                    if self.queue_mgr.items:
-                        item = self.queue_mgr.items[0]
-                        if abs(item['progress'] - val) > 0.01:  # throttle updates
-                            item['progress'] = val
-                            if 'pb' in item:
-                                item['pb'].set(val)
+                if msg[0] == "progress":
+                    idx, val = msg[1], msg[2]
+                    if 0 <= idx < len(self.queue_mgr.items):
+                        item = self.queue_mgr.items[idx]
+                        if abs(item["progress"] - val) > 0.01:
+                            item["progress"] = val
+                            if "pb" in item:
+                                item["pb"].set(val)
                             updated = True
-                elif msg[0]=='status':
-                    idx,status = msg[1],msg[2]
-                    if self.queue_mgr.items:
-                        item = self.queue_mgr.items[0]
-                        item['status']=status
+                elif msg[0] == "status":
+                    idx, status = msg[1], msg[2]
+                    if 0 <= idx < len(self.queue_mgr.items):
+                        item = self.queue_mgr.items[idx]
+                        item["status"] = status
+                        if "status_lbl" in item:
+                            status_color = {"queued": "#888888", "downloading": "#3498db", "done": "#27ae60", "error": "#e74c3c"}.get(status, "#888888")
+                            item["status_lbl"].configure(text=status.upper(), text_color=status_color)
                         updated = True
-                elif msg[0]=='error':
-                    idx,err = msg[1],msg[2]
-                    if self.queue_mgr.items:
-                        item=self.queue_mgr.items[0]
-                        item['status']='error'
-                        messagebox.showerror("Download Error",f"{item['title']}\n{err}")
+                elif msg[0] == "error":
+                    idx, err = msg[1], msg[2]
+                    if 0 <= idx < len(self.queue_mgr.items):
+                        item = self.queue_mgr.items[idx]
+                        item["status"] = "error"
+                        messagebox.showerror("Download Error", f"{item['title']}\n{err}")
                         updated = True
             except Exception as e:
-                print("GUI update error:",e)
+                logging.error(f"GUI update error: {e}")
         if updated:
             self.refresh_queue_list()
-        self.root.after(300,self._process_gui_updates)
+        self.status_var.set(f"Active Downloads: {self.downloader.active_downloads} | Total in Queue: {len(self.queue_mgr.items)}")
+        self.root.after(500, self._process_gui_updates)
 
     # ---------------- Settings ----------------
     def show_settings(self):
+        """Display the Settings section."""
         self._clear_content()
         page = self.content_frame
-        # Download directory
-        dir_frame=ctk.CTkFrame(page)
-        dir_frame.pack(fill="x",pady=6)
-        dir_var=tk.StringVar(value=self.settings.data.get('download_dir',''))
-        ctk.CTkLabel(dir_frame,text="Download Directory:").pack(side="left",padx=6)
-        ctk.CTkEntry(dir_frame,textvariable=dir_var).pack(side="left",fill="x",expand=True,padx=6)
-        def browse_dir():
-            p=filedialog.askdirectory()
-            if p:
-                dir_var.set(p)
-                self._update_setting('download_dir',p)
-        ctk.CTkButton(dir_frame,text="Browse",command=browse_dir,width=120).pack(side="left",padx=6)
-        # Cookies file
-        cookie_frame=ctk.CTkFrame(page)
-        cookie_frame.pack(fill="x",pady=6)
-        cookie_var=tk.StringVar(value=self.settings.data.get('cookies',''))
-        ctk.CTkLabel(cookie_frame,text="Cookies File:").pack(side="left",padx=6)
-        ctk.CTkEntry(cookie_frame,textvariable=cookie_var).pack(side="left",fill="x",expand=True,padx=6)
-        def browse_cookie():
-            f=filedialog.askopenfilename(filetypes=[("Cookies files","*.txt")])
-            if f:
-                cookie_var.set(f)
-                self._update_setting('cookies',f)
-        ctk.CTkButton(cookie_frame,text="Browse",command=browse_cookie,width=120).pack(side="left",padx=6)
-        # Ask folder each time
-        ask_var = tk.BooleanVar(value=self.settings.data.get('ask_folder',True))
-        ctk.CTkCheckBox(page,text="Ask download folder each time",variable=ask_var,
-                         command=lambda:self._update_setting('ask_folder',ask_var.get())).pack(pady=6)
-        # Simultaneous downloads
-        sim_frame=ctk.CTkFrame(page)
-        sim_frame.pack(fill="x",pady=6)
-        sim_var=tk.IntVar(value=self.settings.data.get('simultaneous_downloads',1))
-        ctk.CTkLabel(sim_frame,text="Simultaneous Downloads:").pack(side="left",padx=6)
-        ctk.CTkEntry(sim_frame,textvariable=sim_var,width=60).pack(side="left",padx=6)
-        def update_sim(e=None):
-            self._update_setting('simultaneous_downloads',sim_var.get())
-        sim_var.trace_add("write", lambda *args: update_sim())
+        ctk.CTkLabel(page, text="Settings", font=("Helvetica", 16, "bold")).pack(pady=10)
+        dir_var = tk.StringVar(value=self.settings.data.get("download_dir", ""))
+        self._create_entry(page, "Download Directory:", "Select download directory", dir_var.get())
+        ctk.CTkButton(page, text="Browse", command=lambda: self._browse_dir(dir_var), width=120).pack(pady=5)
+        cookie_var = tk.StringVar(value=self.settings.data.get("cookies", ""))
+        self._create_entry(page, "Cookies File:", "Select cookies file", cookie_var.get())
+        ctk.CTkButton(page, text="Browse", command=lambda: self._browse_cookie(cookie_var), width=120).pack(pady=5)
+        ask_var = tk.BooleanVar(value=self.settings.data.get("ask_folder", True))
+        ctk.CTkCheckBox(page, text="Ask for download folder each time", variable=ask_var,
+                        command=lambda: self.settings.update("ask_folder", ask_var.get())).pack(pady=10)
+        sim_var = tk.IntVar(value=self.settings.data.get("simultaneous_downloads", 1))
+        self._create_entry(page, "Simultaneous Downloads:", "Enter number of downloads", str(sim_var.get()), width=100)
+        sim_var.trace_add("write", lambda *args: self.settings.update("simultaneous_downloads", sim_var.get()))
+        self._create_option_menu(page, "Default Audio Effect:", ["None", "8D", "9D"],
+                                 self.settings.data.get("audio_effect", "none").capitalize(),
+                                 lambda v: self.settings.update("audio_effect", v.lower()))
+        sub_var = tk.BooleanVar(value=self.settings.data.get("download_subtitles", False))
+        ctk.CTkCheckBox(page, text="Download Subtitles (for videos)", variable=sub_var,
+                        command=lambda: self.settings.update("download_subtitles", sub_var.get())).pack(pady=10)
+        sub_lang_var = tk.StringVar(value=self.settings.data.get("subtitle_lang", "en"))
+        self._create_entry(page, "Subtitle Language:", "e.g., en", sub_lang_var.get(), width=100)
+        sub_lang_var.trace_add("write", lambda *args: self.settings.update("subtitle_lang", sub_lang_var.get()))
+        thumb_var = tk.BooleanVar(value=self.settings.data.get("download_thumbnail", False))
+        ctk.CTkCheckBox(page, text="Download Thumbnail", variable=thumb_var,
+                        command=lambda: self.settings.update("download_thumbnail", thumb_var.get())).pack(pady=10)
+        rate_var = tk.StringVar(value=self.settings.data.get("rate_limit", ""))
+        self._create_entry(page, "Download Rate Limit:", "e.g., 1M", rate_var.get(), width=100)
+        rate_var.trace_add("write", lambda *args: self.settings.update("rate_limit", rate_var.get()))
+        proxy_var = tk.StringVar(value=self.settings.data.get("proxy", ""))
+        self._create_entry(page, "Proxy:", "e.g., http://proxy:port", proxy_var.get(), width=300)
+        proxy_var.trace_add("write", lambda *args: self.settings.update("proxy", proxy_var.get()))
+        self._create_option_menu(page, "Appearance Mode:", ["Light", "Dark", "System"],
+                                 self.settings.data.get("theme", "dark").capitalize(),
+                                 lambda v: [ctk.set_appearance_mode(v.lower()), self.settings.update("theme", v.lower())])
+        self._create_option_menu(page, "Color Theme:", ["blue", "green", "dark-blue"],
+                                 self.settings.data.get("color_theme", "blue"),
+                                 lambda v: [ctk.set_default_color_theme(v), self.settings.update("color_theme", v),
+                                            messagebox.showinfo("Color Theme Updated", "Restart to apply new color theme.")])
 
-    def _update_setting(self,key,value):
-        self.settings.data[key]=value
-        self.settings.save()
+    def _browse_dir(self, var):
+        """Browse for a download directory."""
+        path = filedialog.askdirectory()
+        if path:
+            var.set(path)
+            self.settings.update("download_dir", path)
+
+    def _browse_cookie(self, var):
+        """Browse for a cookies file."""
+        file = filedialog.askopenfilename(filetypes=[("Cookies files", "*.txt")])
+        if file:
+            var.set(file)
+            self.settings.update("cookies", file)
 
 # ---------------- Main ----------------
-if __name__=="__main__":
-    settings=SettingsManager()
-    queue_mgr=QueueManager()
-    root=ctk.CTk()
-    ui=UIManager(root,settings,queue_mgr)
+if __name__ == "__main__":
+    settings = SettingsManager()
+    queue_mgr = QueueManager(settings)
+    history_mgr = HistoryManager(max_entries=settings.data.get("max_history_entries", 100))
+    root = ctk.CTk()
+    ui = UIManager(root, settings, queue_mgr, history_mgr)
     def on_close():
         settings.save()
+        history_mgr.save()
         root.destroy()
-    root.protocol("WM_DELETE_WINDOW",on_close)
+    root.protocol("WM_DELETE_WINDOW", on_close)
     root.mainloop()
