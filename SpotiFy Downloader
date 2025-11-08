@@ -1,0 +1,537 @@
+# --------------------------------------------------------------
+#  Spotify MP3 Downloader – Full GUI + spotDL + Playlist + kbps
+# --------------------------------------------------------------
+import os
+import json
+import threading
+import queue as pyqueue
+import subprocess
+import traceback
+import tkinter as tk
+from tkinter import filedialog, messagebox
+import customtkinter as ctk
+from datetime import datetime
+import re
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
+import logging
+
+# ---------------- Constants ----------------
+SETTINGS_FILE = "settings_spotify.json"
+HISTORY_FILE   = "download_history_spotify.json"
+LOG_FILE       = "spotify_downloader.log"
+
+DEFAULT_SETTINGS = {
+    "download_dir": "",
+    "ask_folder": True,
+    "audio_bitrate": "320",
+    "simultaneous_downloads": 2,
+    "theme": "dark",
+    "color_theme": "blue",
+    "max_history_entries": 200,
+    "rate_limit": "",
+    "proxy": ""
+}
+
+# ---------------- Logging ----------------
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# ---------------- Utility Functions ----------------
+def format_size(size):
+    if size is None: return ''
+    size = float(size)
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024: return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} PB"
+
+def clean_spotify_url(url: str) -> str:
+    """Remove ?si=... and trailing slash"""
+    return url.split("?")[0].rstrip("/")
+
+def validate_spotify_url(url: str) -> bool:
+    """Accept track, album, playlist, artist URLs (with or without ?si=)"""
+    clean = clean_spotify_url(url)
+    pattern = r"^https?://open\.spotify\.com/(track|album|playlist|artist)/[a-zA-Z0-9]+$"
+    return bool(re.fullmatch(pattern, clean))
+
+# ---------------- Settings / History ----------------
+class SettingsManager:
+    def __init__(self, path=SETTINGS_FILE):
+        self.path = path
+        self.data = DEFAULT_SETTINGS.copy()
+        self.load()
+    def load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    self.data.update({k: v for k, v in loaded.items() if k in self.data})
+            except Exception as e:
+                logging.error(f"Settings load error: {e}")
+    def save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=4)
+        except Exception as e:
+            logging.error(f"Settings save error: {e}")
+    def update(self, key, value):
+        if key not in self.data: return
+        if key == "simultaneous_downloads":
+            try: value = max(1, int(value))
+            except: value = 1
+        elif key == "rate_limit" and value:
+            if not re.match(r"^\d+[KM]?$", value): return
+        self.data[key] = value
+        self.save()
+
+class HistoryManager:
+    def __init__(self, path=HISTORY_FILE, max_entries=200):
+        self.path = path
+        self.max_entries = max_entries
+        self.history = []
+        self.load()
+    def load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self.history = json.load(f)
+            except: self.history = []
+    def save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.history[-self.max_entries:], f, indent=4)
+        except Exception as e:
+            logging.error(f"History save error: {e}")
+    def add(self, item):
+        self.history.append({
+            "url": item["url"],
+            "title": item["title"],
+            "type": item["type"],
+            "bitrate": item.get("bitrate", "320"),
+            "timestamp": datetime.now().isoformat(),
+            "status": item["status"],
+            "file_path": item.get("file_path", "")
+        })
+        self.save()
+    def clear(self):
+        self.history.clear0
+        self.save()
+
+# ---------------- Queue Manager ----------------
+class QueueManager:
+    def __init__(self, settings):
+        self.settings = settings
+        self.items = []
+    def add(self, url, type_):
+        self.items.append({
+            "url": url,
+            "title": "Fetching…",
+            "type": type_,
+            "progress": 0.0,
+            "status": "queued",
+            "file_path": "",
+            "bitrate": self.settings.data.get("audio_bitrate", "320")
+        })
+        return len(self.items) - 1
+    def remove(self, idx):
+        if 0 <= idx < len(self.items):
+            del self.items[idx]
+    def clear(self):
+        self.items.clear()
+
+# ---------------- Downloader (spotDL) ----------------
+class Downloader:
+    def __init__(self, settings, gui_queue, queue_mgr, history_mgr):
+        self.settings = settings
+        self.gui_q = gui_queue
+        self.queue_mgr = queue_mgr
+        self.history_mgr = history_mgr
+        self.running = False
+        self.active = 0
+        self.lock = threading.Lock()
+
+    def start(self):
+        if self.running: return
+        self.running = True
+        sim = max(1, self.settings.data.get("simultaneous_downloads", 2))
+        for _ in range(sim):
+            threading.Thread(target=self._worker, daemon=True).start()
+
+    def stop(self):
+        self.running = False
+
+    def _worker(self):
+        while self.running:
+            item = None
+            idx = -1
+            with self.lock:
+                for i, it in enumerate(self.queue_mgr.items):
+                    if it["status"] == "queued":
+                        it["status"] = "downloading"
+                        item, idx = it, i
+                        self.active += 1
+                        break
+            if not item: break
+
+            save_path = self._get_save_path()
+            if not save_path:
+                self.gui_q.put(("status", idx, "error"))
+                self.gui_q.put(("error", idx, "No folder selected"))
+                with self.lock: self.active -= 1
+                continue
+
+            try:
+                cmd = [
+                    "spotdl", "download", item["url"],
+                    "--output", save_path,
+                    "--bitrate", f"{item['bitrate']}k",
+                    "--format", "mp3"
+                ]
+                if self.settings.data.get("rate_limit"):
+                    cmd += ["--download-threads", "1"]
+                if self.settings.data.get("proxy"):
+                    cmd += ["--proxy", self.settings.data["proxy"]]
+
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True
+                )
+
+                current_title = "Unknown"
+                for line in process.stdout:
+                    line = line.strip()
+                    if not line: continue
+
+                    # Extract title
+                    if "Downloading" in line and "│" in line:
+                        parts = line.split("│")
+                        if len(parts) > 1:
+                            title_part = parts[-1].strip()
+                            if "  " in title_part:
+                                current_title = title_part.split("  ")[0]
+                                self.gui_q.put(("title", idx, current_title))
+
+                    # Progress %
+                    m = re.search(r"(\d+)%", line)
+                    if m:
+                        prog = int(m.group(1)) / 100.0
+                        self.gui_q.put(("progress", idx, prog))
+
+                process.wait()
+                if process.returncode == 0:
+                    # Guess final file
+                    guessed = os.path.join(save_path, f"{current_title}.mp3")
+                    if not os.path.exists(guessed):
+                        mp3s = [f for f in os.listdir(save_path) if f.endswith(".mp3")]
+                        if mp3s:
+                            guessed = os.path.join(save_path, max(mp3s, key=lambda f: os.path.getctime(os.path.join(save_path, f))))
+                    item["title"] = current_title
+                    item["file_path"] = guessed
+                    self.gui_q.put(("status", idx, "done"))
+                    self.history_mgr.add(item)
+                else:
+                    self.gui_q.put(("status", idx, "error"))
+                    self.gui_q.put(("error", idx, "Download failed"))
+            except Exception as e:
+                tb = traceback.format_exc()
+                logging.error(f"Error: {e}\n{tb}")
+                self.gui_q.put(("status", idx, "error"))
+                self.gui_q.put(("error", idx, str(e)))
+            finally:
+                with self.lock: self.active -= 1
+
+    def _get_save_path(self):
+        path = self.settings.data.get("download_dir")
+        if self.settings.data.get("ask_folder", True) or not path:
+            path = filedialog.askdirectory(title="Select download folder")
+            if path:
+                self.settings.update("download_dir", path)
+        return path
+
+# ---------------- UI Manager ----------------
+class UIManager:
+    def __init__(self, root, settings, queue_mgr, history_mgr):
+        self.root = root
+        self.settings = settings
+        self.queue_mgr = queue_mgr
+        self.history_mgr = history_mgr
+        self.gui_q = pyqueue.Queue()
+        self.downloader = Downloader(settings, self.gui_q, queue_mgr, history_mgr)
+        self.status_var = tk.StringVar(value="Ready")
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.last_gui = 0
+        self._build_ui()
+        self.root.after(300, self._process_gui_q)
+
+    def _build_ui(self):
+        ctk.set_appearance_mode(self.settings.data.get("theme", "dark"))
+        ctk.set_default_color_theme(self.settings.data.get("color_theme", "blue"))
+        self.root.title("Spotify MP3 Downloader")
+        self.root.geometry("1180x860")
+        self.root.minsize(1000, 700)
+
+        # Sidebar
+        self.sidebar = ctk.CTkFrame(self.root, width=230, corner_radius=10)
+        self.sidebar.pack(side="left", fill="y", padx=10, pady=10)
+        ctk.CTkLabel(self.sidebar, text="Spotify MP3", font=("Helvetica", 20, "bold")).pack(pady=20)
+
+        menu = [
+            ("Single Track", self.show_single),
+            ("Album / Playlist", self.show_playlist),
+            ("Queue", self.show_queue),
+            ("History", self.show_history),
+            ("Settings", self.show_settings)
+        ]
+        for txt, cmd in menu:
+            ctk.CTkButton(self.sidebar, text=txt, command=cmd,
+                          width=200, height=44, font=("Helvetica", 13)).pack(pady=6, padx=12)
+
+        # Content
+        self.content = ctk.CTkFrame(self.root, corner_radius=10)
+        self.content.pack(side="right", expand=True, fill="both", padx=10, pady=10)
+
+        # Status bar
+        sb = ctk.CTkFrame(self.root, height=30, corner_radius=0)
+        sb.pack(side="bottom", fill="x")
+        ctk.CTkLabel(sb, textvariable=self.status_var, font=("Helvetica", 11)).pack(side="left", padx=12)
+
+        self.show_single()
+
+    def _clear(self):
+        for w in self.content.winfo_children(): w.destroy()
+
+    def _entry(self, parent, label, placeholder="", default="", width=800):
+        fr = ctk.CTkFrame(parent, corner_radius=8)
+        fr.pack(fill="x", pady=4, padx=10)
+        ctk.CTkLabel(fr, text=label, width=150, anchor="w").pack(side="left", padx=8)
+        e = ctk.CTkEntry(fr, width=width, placeholder_text=placeholder, font=("Helvetica", 12))
+        e.pack(side="left", fill="x", expand=True, padx=8)
+        if default: e.insert(0, default)
+        return e
+
+    def _optmenu(self, parent, label, values, default, cmd, width=120):
+        fr = ctk.CTkFrame(parent, corner_radius=8)
+        fr.pack(fill="x", pady=4, padx=10)
+        ctk.CTkLabel(fr, text=label, width=150, anchor="w").pack(side="left", padx=8)
+        var = tk.StringVar(value=default)
+        ctk.CTkOptionMenu(fr, values=values, variable=var, command=cmd, width=width).pack(side="left")
+        return var
+
+    def _btn(self, parent, text, cmd, width=180):
+        return ctk.CTkButton(parent, text=text, command=cmd, width=width,
+                             font=("Helvetica", 12)).pack(pady=6)
+
+    # ---------------- Sections ----------------
+    def show_single(self):
+        self._clear()
+        page = self.content
+        ctk.CTkLabel(page, text="Download Single Track", font=("Helvetica", 17, "bold")).pack(pady=12)
+        url_e = self._entry(page, "Spotify URL:", "https://open.spotify.com/track/…")
+        self._optmenu(page, "Bitrate:", ["128", "192", "256", "320"],
+                      self.settings.data.get("audio_bitrate", "320"),
+                      lambda v: self.settings.update("audio_bitrate", v))
+
+        def add():
+            raw = url_e.get().strip()
+            url = clean_spotify_url(raw)
+            if not validate_spotify_url(url):
+                messagebox.showerror("Invalid URL", "Please paste a valid Spotify link.")
+                return
+            self.queue_mgr.add(url, "track")
+            self.show_queue()
+        self._btn(page, "Add to Queue", add)
+
+    def show_playlist(self):
+        self._clear()
+        page = self.content
+        ctk.CTkLabel(page, text="Download Album / Playlist", font=("Helvetica", 17, "bold")).pack(pady=12)
+        url_e = self._entry(page, "Spotify URL:", "https://open.spotify.com/playlist/…")
+        self._optmenu(page, "Bitrate:", ["128", "192", "256", "320"],
+                      self.settings.data.get("audio_bitrate", "320"),
+                      lambda v: self.settings.update("audio_bitrate", v))
+
+        def add():
+            raw = url_e.get().strip()
+            url = clean_spotify_url(raw)
+            if not validate_spotify_url(url):
+                messagebox.showerror("Invalid URL", "Please paste a valid Spotify link.")
+                return
+            self.queue_mgr.add(url, "playlist")
+            self.show_queue()
+        self._btn(page, "Add to Queue", add)
+
+    def show_queue(self):
+        self._clear()
+        page = self.content
+        ctk.CTkLabel(page, text="Download Queue", font=("Helvetica", 17, "bold")).pack(pady=10)
+        ctrl = ctk.CTkFrame(page)
+        ctrl.pack(fill="x", pady=8)
+        self._btn(ctrl, "Start", self.downloader.start, 140)
+        self._btn(ctrl, "Stop", self.downloader.stop, 140)
+        self._btn(ctrl, "Clear", lambda: [self.queue_mgr.clear(), self.refresh_queue()], 140)
+
+        self.qscroll = ctk.CTkScrollableFrame(page, height=560)
+        self.qscroll.pack(fill="both", expand=True, pady=8, padx=10)
+        self.refresh_queue()
+
+    def refresh_queue(self):
+        for w in self.qscroll.winfo_children(): w.destroy()
+        for idx, it in enumerate(self.queue_mgr.items):
+            fr = ctk.CTkFrame(self.qscroll, height=62, corner_radius=8)
+            fr.pack(fill="x", pady=4, padx=8)
+
+            title_lbl = ctk.CTkLabel(fr, text=it["title"], anchor="w", font=("Helvetica", 12))
+            title_lbl.pack(side="left", padx=10, fill="x", expand=True)
+            it["title_lbl"] = title_lbl
+
+            col = {"queued":"#999", "downloading":"#3498db", "done":"#27ae60", "error":"#e74c3c"}
+            stat_lbl = ctk.CTkLabel(fr, text=it["status"].upper(),
+                                    text_color=col.get(it["status"], "#999"),
+                                    font=("Helvetica", 12, "bold"))
+            stat_lbl.pack(side="right", padx=10)
+            it["stat_lbl"] = stat_lbl
+
+            pb = ctk.CTkProgressBar(fr, width=220)
+            pb.pack(side="right", padx=10)
+            pb.set(it.get("progress", 0))
+            it["pb"] = pb
+
+            if it["status"] == "queued":
+                ctk.CTkOptionMenu(fr, values=["128","192","256","320"],
+                                  variable=tk.StringVar(value=it["bitrate"]),
+                                  command=lambda v, i=idx: self.queue_mgr.items[i].__setitem__("bitrate", v),
+                                  width=80).pack(side="right", padx=5)
+
+            ctk.CTkButton(fr, text="Remove", width=80,
+                          command=lambda i=idx: [self.queue_mgr.remove(i), self.refresh_queue()]).pack(side="right", padx=5)
+
+    def show_history(self):
+        self._clear()
+        page = self.content
+        ctk.CTkLabel(page, text="Download History", font=("Helvetica", 17, "bold")).pack(pady=12)
+        ctrl = ctk.CTkFrame(page)
+        ctrl.pack(fill="x", pady=6)
+        self._btn(ctrl, "Clear History", lambda: [self.history_mgr.clear(), self.show_history()], 160)
+
+        scroll = ctk.CTkScrollableFrame(page, height=580)
+        scroll.pack(fill="both", expand=True, pady=8, padx=10)
+
+        for it in reversed(self.history_mgr.history):
+            fr = ctk.CTkFrame(scroll, height=58, corner_radius=8)
+            fr.pack(fill="x", pady=3, padx=6)
+
+            txt = f"[{it['type'].upper()}] {it['title']} – {it['bitrate']} kbps ({it['timestamp'][:19]})"
+            ctk.CTkLabel(fr, text=txt, anchor="w", font=("Helvetica", 11)).pack(side="left", padx=10, fill="x", expand=True)
+
+            col = {"done":"#27ae60", "error":"#e74c3c"}.get(it["status"], "#999")
+            ctk.CTkLabel(fr, text=it["status"].upper(), text_color=col,
+                         font=("Helvetica", 11, "bold")).pack(side="right", padx=10)
+
+            if it.get("file_path") and os.path.exists(it["file_path"]):
+                ctk.CTkButton(fr, text="Open File", width=90,
+                              command=lambda p=it["file_path"]: os.startfile(p) if os.name=="nt" else subprocess.run(["xdg-open", p])).pack(side="right", padx=5)
+                ctk.CTkButton(fr, text="Folder", width=80,
+                              command=lambda p=it["file_path"]: os.startfile(os.path.dirname(p)) if os.name=="nt" else subprocess.run(["xdg-open", os.path.dirname(p)])).pack(side="right", padx=5)
+
+    def show_settings(self):
+        self._clear()
+        page = self.content
+        ctk.CTkLabel(page, text="Settings", font=("Helvetica", 17, "bold")).pack(pady=12)
+
+        dir_var = tk.StringVar(value=self.settings.data.get("download_dir",""))
+        self._entry(page, "Download Folder:", default=dir_var.get())
+        ctk.CTkButton(page, text="Browse", width=120,
+                      command=lambda: self._pick_folder(dir_var)).pack(pady=4)
+
+        ask_var = tk.BooleanVar(value=self.settings.data.get("ask_folder", True))
+        ctk.CTkCheckBox(page, text="Ask folder each download", variable=ask_var,
+                        command=lambda: self.settings.update("ask_folder", ask_var.get())).pack(pady=6, anchor="w", padx=20)
+
+        sim_var = tk.IntVar(value=self.settings.data.get("simultaneous_downloads", 2))
+        self._entry(page, "Simultaneous Downloads:", default=str(sim_var.get()), width=120)
+        sim_var.trace_add("write", lambda *a: self.settings.update("simultaneous_downloads", sim_var.get()))
+
+        rate_var = tk.StringVar(value=self.settings.data.get("rate_limit",""))
+        self._entry(page, "Rate limit (e.g. 1M):", default=rate_var.get(), width=180)
+        rate_var.trace_add("write", lambda *a: self.settings.update("rate_limit", rate_var.get()))
+
+        proxy_var = tk.StringVar(value=self.settings.data.get("proxy",""))
+        self._entry(page, "Proxy[](http://…):", default=proxy_var.get(), width=300)
+        proxy_var.trace_add("write", lambda *a: self.settings.update("proxy", proxy_var.get()))
+
+        self._optmenu(page, "Theme:", ["light","dark","system"],
+                      self.settings.data.get("theme","dark").capitalize(),
+                      lambda v: [ctk.set_appearance_mode(v.lower()), self.settings.update("theme", v.lower())])
+        self._optmenu(page, "Color:", ["blue","green","dark-blue"],
+                      self.settings.data.get("color_theme","blue"),
+                      lambda v: [ctk.set_default_color_theme(v), self.settings.update("color_theme", v)])
+
+    def _pick_folder(self, var):
+        p = filedialog.askdirectory()
+        if p:
+            var.set(p)
+            self.settings.update("download_dir", p)
+
+    def _process_gui_q(self):
+        now = datetime.now().timestamp()
+        if now - self.last_gui < 0.25:
+            self.root.after(100, self._process_gui_q)
+            return
+        self.last_gui = now
+
+        while not self.gui_q.empty():
+            try:
+                typ, *args = self.gui_q.get_nowait()
+                if typ == "progress" and len(args) == 2:
+                    idx, prog = args
+                    if 0 <= idx < len(self.queue_mgr.items):
+                        it = self.queue_mgr.items[idx]
+                        if abs(it.get("progress",0) - prog) > 0.01:
+                            it["progress"] = prog
+                            if "pb" in it: it["pb"].set(prog)
+                elif typ == "status" and len(args) == 2:
+                    idx, stat = args
+                    if 0 <= idx < len(self.queue_mgr.items):
+                        it = self.queue_mgr.items[idx]
+                        it["status"] = stat
+                        if "stat_lbl" in it:
+                            col = {"queued":"#999","downloading":"#3498db","done":"#27ae60","error":"#e74c3c"}
+                            it["stat_lbl"].configure(text=stat.upper(), text_color=col.get(stat,"#999"))
+                elif typ == "title" and len(args) == 2:
+                    idx, title = args
+                    if 0 <= idx < len(self.queue_mgr.items):
+                        it = self.queue_mgr.items[idx]
+                        it["title"] = title
+                        if "title_lbl" in it: it["title_lbl"].configure(text=title)
+                elif typ == "error" and len(args) == 2:
+                    idx, msg = args
+                    messagebox.showerror("Download error", msg)
+            except Exception as e:
+                logging.error(f"GUI queue error: {e}")
+
+        self.status_var.set(f"Active: {self.downloader.active} | Queue: {len(self.queue_mgr.items)}")
+        self.root.after(300, self._process_gui_q)
+
+# ------------------------------------------------------------------ MAIN
+if __name__ == "__main__":
+    settings = SettingsManager()
+    queue_mgr = QueueManager(settings)
+    history_mgr = HistoryManager(max_entries=settings.data.get("max_history_entries", 200))
+    root = ctk.CTk()
+    ui = UIManager(root, settings, queue_mgr, history_mgr)
+
+    def on_close():
+        settings.save()
+        history_mgr.save()
+        root.destroy()
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.mainloop()
