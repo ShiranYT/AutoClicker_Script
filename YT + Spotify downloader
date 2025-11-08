@@ -1,0 +1,259 @@
+# --------------------------------------------------------------
+#  Universal Downloader Launcher – NO THREADING ERRORS
+# --------------------------------------------------------------
+import os
+import json
+import tkinter as tk
+from tkinter import messagebox
+import customtkinter as ctk
+import threading
+import time
+import subprocess
+import tempfile
+import requests
+import sys
+from datetime import datetime
+
+# ---------------- Constants ----------------
+CONFIG_FILE = "launcher_config.json"
+YT_SCRIPT_URL = "https://raw.githubusercontent.com/ShiranYT/AutoClicker_Script/refs/heads/main/YT_Downloader"
+SPOTIFY_SCRIPT_URL = "https://raw.githubusercontent.com/ShiranYT/AutoClicker_Script/refs/heads/main/SpotiFy%20Downloader"
+
+DEFAULT_CONFIG = {
+    "theme": "dark",
+    "color_theme": "blue",
+    "auto_download_scripts": True
+}
+
+# ---------------- Config ----------------
+class ConfigManager:
+    def __init__(self, path=CONFIG_FILE):
+        self.path = path
+        self.data = DEFAULT_CONFIG.copy()
+        self.load()
+    def load(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    self.data.update({k: v for k, v in loaded.items() if k in self.data})
+            except Exception: pass
+    def save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=4)
+        except Exception: pass
+    def update(self, key, value):
+        if key in self.data:
+            self.data[key] = value
+            self.save()
+
+# ---------------- Script download ----------------
+def download_script(url, local_path):
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        with open(local_path, "w", encoding="utf-8") as f:
+            f.write(r.text)
+        return True
+    except Exception as e:
+        messagebox.showerror("Download error", f"Failed to download script:\n{e}")
+        return False
+
+# ---------------- Loading window (main-thread only) ----------------
+class LoadingWindow:
+    def __init__(self, parent, title, on_finish):
+        self.parent = parent
+        self.on_finish = on_finish                     # callback when animation ends
+        self.window = ctk.CTkToplevel(parent)
+        self.window.title(title)
+        self.window.geometry("420x220")
+        self.window.resizable(False, False)
+        self.window.transient(parent)
+        self.window.grab_set()
+        self.window.configure(fg_color="#000000")
+
+        # centre
+        x = parent.winfo_rootx() + parent.winfo_width() // 2 - 210
+        y = parent.winfo_rooty() + parent.winfo_height() // 2 - 110
+        self.window.geometry(f"+{x}+{y}")
+
+        ctk.CTkLabel(self.window, text=title,
+                     font=("Helvetica", 18, "bold"), text_color="#00ffff").pack(pady=25)
+
+        self.canvas = tk.Canvas(self.window, width=100, height=100,
+                                bg="#000000", highlightthickness=0)
+        self.canvas.pack(pady=10)
+        self.canvas.create_oval(15, 15, 85, 85, outline="#00ffff", width=4, tags="ring")
+
+        self.dots_lbl = ctk.CTkLabel(self.window, text="Loading",
+                                     font=("Helvetica", 14), text_color="white")
+        self.dots_lbl.pack(pady=10)
+
+        self.start = time.time()
+        self.angle = 0
+        self.dots = 0
+        self.animate()
+
+    def animate(self):
+        elapsed = time.time() - self.start
+        prog = min(elapsed / 2.5, 1.0)
+
+        # rotating arc
+        self.canvas.delete("arc")
+        self.canvas.create_arc(15, 15, 85, 85, start=self.angle,
+                               extent=300 * prog, outline="#00ffff",
+                               width=4, style="arc", tags="arc")
+        self.angle = (self.angle + 12) % 360
+
+        # dots
+        if int(elapsed * 3) % 4 == 0 and self.dots < 3:
+            self.dots += 1
+            self.dots_lbl.configure(text="Loading" + "." * self.dots)
+
+        if prog < 1.0:
+            self.window.after(50, self.animate)
+        else:
+            self.window.after(300, self._finish)
+
+    def _finish(self):
+        self.window.destroy()
+        if self.on_finish:
+            self.on_finish()
+
+# ---------------- Launcher UI ----------------
+class LauncherUI:
+    def __init__(self):
+        self.config = ConfigManager()
+        self.root = ctk.CTk()
+        self.title_lbl = None
+        self.yt_btn = None
+        self.spotify_btn = None
+        self._build_ui()
+        ctk.set_appearance_mode(self.config.data.get("theme", "dark"))
+        ctk.set_default_color_theme(self.config.data.get("color_theme", "blue"))
+
+    # ---------------------------------------------------------- UI
+    def _build_ui(self):
+        self.root.title("Universal Downloader")
+        self.root.geometry("620x440")
+        self.root.minsize(550, 380)
+
+        self.title_lbl = ctk.CTkLabel(self.root,
+                                      text="Choose Your Downloader",
+                                      font=("Helvetica", 26, "bold"),
+                                      text_color="#00ffff")
+        self.title_lbl.pack(pady=60)
+
+        self.yt_btn = ctk.CTkButton(self.root,
+                                    text="YouTube Downloader",
+                                    command=self.launch_yt,
+                                    width=320, height=70,
+                                    font=("Helvetica", 16, "bold"),
+                                    fg_color="#ff0000", hover_color="#cc0000",
+                                    corner_radius=15)
+        self.yt_btn.pack(pady=15)
+
+        self.spotify_btn = ctk.CTkButton(self.root,
+                                         text="Spotify MP3 Downloader",
+                                         command=self.launch_spotify,
+                                         width=320, height=70,
+                                         font=("Helvetica", 16, "bold"),
+                                         fg_color="#1db954", hover_color="#1ed760",
+                                         corner_radius=15)
+        self.spotify_btn.pack(pady=15)
+
+        ctk.CTkButton(self.root, text="Settings",
+                      command=self.show_settings,
+                      width=140, height=32,
+                      font=("Helvetica", 11)).pack(pady=25)
+
+    # ---------------------------------------------------------- helpers
+    def disable_ui(self):
+        self.title_lbl.configure(state="disabled")
+        self.yt_btn.configure(state="disabled")
+        self.spotify_btn.configure(state="disabled")
+
+    def enable_ui(self):
+        self.title_lbl.configure(state="normal")
+        self.yt_btn.configure(state="normal")
+        self.spotify_btn.configure(state="normal")
+
+    def _get_script_path(self, url, name):
+        local_dir = os.path.join(tempfile.gettempdir(), "universal_downloader")
+        os.makedirs(local_dir, exist_ok=True)
+        path = os.path.join(local_dir, name)
+
+        if self.config.data.get("auto_download_scripts", True) or not os.path.exists(path):
+            if not download_script(url, path):
+                self.enable_ui()
+                return None
+        return path
+
+    def _run_script(self, path):
+        try:
+            if os.name == "nt":
+                subprocess.Popen([sys.executable, path],
+                                 creationflags=subprocess.CREATE_NEW_CONSOLE)
+            else:
+                subprocess.Popen([sys.executable, path])
+        except Exception as e:
+            messagebox.showerror("Run error", f"Could not start script:\n{e}")
+        finally:
+            self.root.after(1500, self.enable_ui)
+
+    # ---------------------------------------------------------- launch
+    def _start_download_and_run(self, url, name, title):
+        """Runs in a background thread – only the download part."""
+        script_path = self._get_script_path(url, name)
+        if script_path:
+            # back to main thread to run the script
+            self.root.after(0, lambda: self._run_script(script_path))
+
+    def launch_yt(self):
+        self.disable_ui()
+        LoadingWindow(self.root,
+                      "Launching YouTube Downloader…",
+                      lambda: threading.Thread(
+                          target=self._start_download_and_run,
+                          args=(YT_SCRIPT_URL, "yt_downloader.py", "YouTube"),
+                          daemon=True).start())
+
+    def launch_spotify(self):
+        self.disable_ui()
+        LoadingWindow(self.root,
+                      "Launching Spotify Downloader…",
+                      lambda: threading.Thread(
+                          target=self._start_download_and_run,
+                          args=(SPOTIFY_SCRIPT_URL, "spotify_downloader.py", "Spotify"),
+                          daemon=True).start())
+
+    # ---------------------------------------------------------- settings
+    def show_settings(self):
+        win = ctk.CTkToplevel(self.root)
+        win.title("Settings")
+        win.geometry("340x240")
+        win.resizable(False, False)
+
+        var_auto = tk.BooleanVar(value=self.config.data.get("auto_download_scripts", True))
+        ctk.CTkCheckBox(win, text="Always download fresh scripts",
+                        variable=var_auto,
+                        command=lambda: self.config.update("auto_download_scripts", var_auto.get())).pack(pady=20)
+
+        ctk.CTkOptionMenu(win, values=["light", "dark", "system"],
+                          command=lambda v: [ctk.set_appearance_mode(v), self.config.update("theme", v)],
+                          variable=tk.StringVar(value=self.config.data.get("theme", "dark"))).pack(pady=10)
+
+        ctk.CTkOptionMenu(win, values=["blue", "green", "dark-blue"],
+                          command=lambda v: [ctk.set_default_color_theme(v), self.config.update("color_theme", v)],
+                          variable=tk.StringVar(value=self.config.data.get("color_theme", "blue"))).pack(pady=10)
+
+        ctk.CTkButton(win, text="Close", command=win.destroy).pack(pady=15)
+
+    # ---------------------------------------------------------- run
+    def run(self):
+        self.root.mainloop()
+
+# ---------------- MAIN ----------------
+if __name__ == "__main__":
+    LauncherUI().run()
